@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+"""
+otel_tool_tracker.py — PreToolUse hook that ships Claude Code tool-use
+telemetry to New Relic's Events API.
+
+Design goals:
+  * Never block tool execution (fire-and-forget, always exit 0).
+  * Never leak free-form user content (source code, secrets, file paths).
+    The event is built by an explicit allowlist, with a hardcoded blocklist
+    of dangerous sub-key names as a safety net.
+  * Configuration comes from Claude Code's managed-settings.json so the
+    platform team can roll it out company-wide without per-developer setup.
+
+See plans/snuggly-herding-gizmo.md for the full design.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOOK_VERSION = "1"
+EVENT_TYPE = "ClaudeCodeToolUse"
+ARGS_MAX_LEN = 512
+POST_TIMEOUT_S = 3.0
+
+# --------------------------------------------------------------------------- #
+# Schema definition
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    type: str       # "str" | "int"
+    presence: str   # "always" | "conditional"
+    condition: str  # human-readable condition or "" for always-present fields
+
+
+SCHEMA: dict[str, FieldSpec] = {
+    # Envelope (always present)
+    "eventType":           FieldSpec("str", "always", ""),
+    "timestamp":           FieldSpec("int", "always", ""),
+    "hook_version":        FieldSpec("str", "always", ""),
+    # Tool identity (always present)
+    "tool_name":           FieldSpec("str", "always", ""),
+    "tool_category":       FieldSpec("str", "always", ""),
+    "hook_event_name":     FieldSpec("str", "conditional", "present in payload"),
+    # Plugin / skill identity
+    "plugin_name":         FieldSpec("str", "conditional", "present in payload"),
+    "plugin_version":      FieldSpec("str", "conditional", "present in payload"),
+    "source":              FieldSpec("str", "conditional", "present in payload"),
+    "mcp_plugin":          FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
+    "mcp_tool":            FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
+    "skill_name_hint":     FieldSpec("str", "conditional", "tool_name matches 'Skill(...)'"),
+    # Narrow tool_input sub-keys
+    "subagent_type":       FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
+    "agent_model":         FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
+    "skill":               FieldSpec("str", "conditional", "tool_name == 'Skill' or UserPromptSubmit"),
+    "skill_args_sanitized":FieldSpec("str", "conditional", "tool_name == 'Skill' and args present"),
+    # Session / agent context
+    "session_id":          FieldSpec("str", "conditional", "present in payload"),
+    "agent_id":            FieldSpec("str", "conditional", "present in payload"),
+    "agent_type":          FieldSpec("str", "conditional", "present in payload"),
+    "permission_mode":     FieldSpec("str", "conditional", "present in payload"),
+    # Host context
+    "cwd_basename":        FieldSpec("str", "conditional", "cwd present in payload"),
+    "hostname":            FieldSpec("str", "conditional", "hostname resolvable"),
+    "repo_name":           FieldSpec("str", "conditional", "git remote origin exists"),
+    "user_login":          FieldSpec("str", "conditional", "$USER or $USERNAME set"),
+}
+
+# --------------------------------------------------------------------------- #
+# Allowlists
+# --------------------------------------------------------------------------- #
+
+# Root allowlist: flat set of fields that may appear on the event. Any field
+# not in this set is dropped in build_event().
+ALLOWED_FIELDS = frozenset(SCHEMA.keys())
+
+# Per-tool allowlist of sub-keys that may be copied out of tool_input.
+# NOTE: Keys here are still subject to TOOL_INPUT_BLOCKLIST below, so a
+# dangerous name accidentally added here is still rejected at copy time.
+TOOL_INPUT_SUBKEY_ALLOWLIST: dict[str, frozenset[str]] = {
+    "Skill":  frozenset({"skill", "args"}),
+    "Agent":  frozenset({"subagent_type", "model"}),
+    "Task":   frozenset({"subagent_type", "model"}),
+}
+
+# Hardcoded blocklist of sub-key names that are ALWAYS rejected from
+# tool_input, even if a future PR mistakenly adds them to an allowlist.
+# These are the free-form content fields across documented Claude Code tools.
+TOOL_INPUT_BLOCKLIST = frozenset({
+    "command", "prompt", "content", "old_string", "new_string",
+    "file_path", "query", "url", "description", "pattern",
+    "questions", "answers", "input", "output", "stdout", "stderr",
+    "message", "body", "text", "path", "glob",
+})
+
+# Tools we skip entirely (too noisy, low signal, read-only exploration).
+SKIP_TOOLS = frozenset({"Read", "Grep", "Glob"})
+
+# --------------------------------------------------------------------------- #
+# sanitize_args
+# --------------------------------------------------------------------------- #
+
+# High-confidence secret patterns. Any hit is replaced with [REDACTED].
+# These run in order; the first match for a given span wins.
+_SECRET_PATTERNS: list[re.Pattern[str]] = [
+    # AWS access key
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # Anthropic keys (must run before the generic sk- pattern)
+    re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    # Generic sk- keys (OpenAI, etc.) — allow dashes/underscores inside the key.
+    # Anthropic keys were already handled above.
+    re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{19,}"),
+    # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    # JWTs (three base64url segments)
+    re.compile(r"eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_.+/=-]+"),
+    # Bearer tokens (run BEFORE authorization so the token itself is consumed
+    # even if it's preceded by an Authorization header)
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+"),
+    # Authorization headers — match through end of line so the value is
+    # fully consumed even when it contains spaces ("Bearer xxx").
+    re.compile(r"(?i)authorization\s*[:=][^\n]*"),
+    # Password / API key / secret assignments
+    re.compile(r"(?i)password\s*[=:]\s*\S+"),
+    re.compile(r"(?i)api[_-]?key\s*[=:]\s*\S+"),
+    re.compile(r"(?i)secret\s*[=:]\s*\S+"),
+    # URLs with embedded credentials: https://user:pass@host
+    re.compile(r"https?://[^\s:/@]+:[^\s@]+@"),
+    # Private key blocks (collapse everything between BEGIN/END)
+    re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+        r"[\s\S]*?"
+        r"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+    ),
+]
+
+_CONTROL_BYTES = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MULTI_SPACE_RE = re.compile(r"\s{2,}")
+
+
+def sanitize_args(raw: object) -> str:
+    """Sanitize a free-form skill args string before shipping to New Relic.
+
+    Pipeline: coerce -> redact known secrets -> strip control bytes ->
+    collapse newlines -> truncate. Pure function, no I/O.
+    """
+    if raw is None:
+        return ""
+    try:
+        s = raw if isinstance(raw, str) else str(raw)
+    except Exception:
+        return ""
+
+    # Re-encode to scrub invalid UTF-8 surrogates.
+    s = s.encode("utf-8", "replace").decode("utf-8", "replace")
+
+    for pat in _SECRET_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+
+    s = _CONTROL_BYTES.sub("", s)
+    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = _MULTI_SPACE_RE.sub(" ", s).strip()
+
+    if len(s) > ARGS_MAX_LEN:
+        s = s[:ARGS_MAX_LEN] + "…[truncated]"
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Tool filter / classification / name parsing
+# --------------------------------------------------------------------------- #
+
+def should_track(tool_name: object) -> bool:
+    """Return True if this tool call should be shipped to New Relic."""
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    return tool_name not in SKIP_TOOLS
+
+
+def tool_category(tool_name: str) -> str:
+    if tool_name in ("Bash", "Edit", "Write"):
+        return "mutation"
+    if tool_name == "Skill" or tool_name.startswith("Skill("):
+        return "skill"
+    if tool_name in ("Agent", "Task"):
+        return "agent"
+    if tool_name.startswith("mcp__"):
+        return "mcp"
+    return "other"
+
+
+_SKILL_PAREN_RE = re.compile(r"^Skill\(([^)]+)\)$")
+
+
+def parse_tool_name(tool_name: str) -> dict[str, str]:
+    """Extract plugin/skill identifiers encoded in tool_name itself.
+
+    mcp__<plugin>__<tool> -> {"mcp_plugin", "mcp_tool"}
+    Skill(<name>)         -> {"skill_name_hint"}
+    """
+    out: dict[str, str] = {}
+    if not isinstance(tool_name, str):
+        return out
+
+    if tool_name.startswith("mcp__"):
+        # Split on the literal "__" separator. Format: mcp__<plugin>__<tool>
+        parts = tool_name.split("__", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            out["mcp_plugin"] = parts[1]
+            out["mcp_tool"] = parts[2]
+        return out
+
+    m = _SKILL_PAREN_RE.match(tool_name)
+    if m:
+        out["skill_name_hint"] = m.group(1)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# build_event
+# --------------------------------------------------------------------------- #
+
+_ROOT_COPY_KEYS = (
+    "session_id", "agent_id", "agent_type", "permission_mode",
+    "hook_event_name", "plugin_name", "plugin_version", "source",
+)
+
+
+def _coerce_scalar(v: object) -> object:
+    """Coerce to a New Relic Events API-compatible scalar (str|int|float|bool).
+
+    Returns None if the value is not a simple scalar (NR doesn't accept
+    nested objects in Events API).
+    """
+    if isinstance(v, bool) or isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
+    """Build the event dict to send to New Relic.
+
+    STRICT allowlist: keys in the output are always a subset of ALLOWED_FIELDS.
+    tool_input is read only for sub-keys that are (a) in the per-tool allowlist
+    AND (b) NOT in the global blocklist.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    tool_name = payload.get("tool_name")
+    if not should_track(tool_name):
+        return {}
+    assert isinstance(tool_name, str)  # narrowed by should_track
+
+    event: dict[str, object] = {
+        "eventType": EVENT_TYPE,
+        "timestamp": int(time.time() * 1000),
+        "hook_version": HOOK_VERSION,
+        "tool_name": tool_name,
+        "tool_category": tool_category(tool_name),
+    }
+
+    for k in _ROOT_COPY_KEYS:
+        v = _coerce_scalar(payload.get(k))
+        if v is not None and v != "":
+            event[k] = v
+
+    event.update(parse_tool_name(tool_name))
+
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd else None
+    _add_host_context(event, cwd, hostname=hostname, repo=repo)
+
+    # Per-tool tool_input sub-key extraction.
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        allowed_subkeys = TOOL_INPUT_SUBKEY_ALLOWLIST.get(tool_name, frozenset())
+        for subkey in allowed_subkeys:
+            if subkey in TOOL_INPUT_BLOCKLIST:
+                # Safety net: refuse to copy a blocked name even if an
+                # allowlist mistakenly includes it.
+                continue
+            if subkey not in tool_input:
+                continue
+            raw_val = tool_input.get(subkey)
+
+            if tool_name == "Skill" and subkey == "args":
+                event["skill_args_sanitized"] = sanitize_args(raw_val)
+                continue
+
+            if tool_name == "Skill" and subkey == "skill":
+                v = _coerce_scalar(raw_val)
+                if isinstance(v, str) and v:
+                    event["skill"] = v
+                continue
+
+            if tool_name in ("Agent", "Task") and subkey == "model":
+                v = _coerce_scalar(raw_val)
+                if isinstance(v, str) and v:
+                    event["agent_model"] = v
+                continue
+
+            if tool_name in ("Agent", "Task") and subkey == "subagent_type":
+                v = _coerce_scalar(raw_val)
+                if isinstance(v, str) and v:
+                    event["subagent_type"] = v
+                continue
+
+    # Final enforcement: drop any key that slipped in outside the allowlist.
+    # This is a defense-in-depth check; it should be a no-op by construction.
+    return {k: v for k, v in event.items() if k in ALLOWED_FIELDS}
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+_DEFAULT_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+_MANAGED_SETTINGS_PATH = "/Library/Application Support/ClaudeCode/managed-settings.json"
+
+
+def _parse_kv_pairs(raw: str) -> list[tuple[str, str]]:
+    """Parse 'key=value,key2=value2' format into a list of (key, value) tuples."""
+    if not raw:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            pairs.append((k, v))
+    return pairs
+
+
+def _parse_otlp_headers(raw: str) -> dict[str, str]:
+    """Parse OTEL_EXPORTER_OTLP_HEADERS format: 'key=value,key2=value2'."""
+    return dict(_parse_kv_pairs(raw))
+
+
+def _parse_resource_attributes(raw: str) -> list[dict]:
+    """Parse OTEL_RESOURCE_ATTRIBUTES format: 'k=v,k2=v2' into OTLP attribute list."""
+    return [{"key": k, "value": {"stringValue": v}} for k, v in _parse_kv_pairs(raw)]
+
+
+def _resolve_otlp_config(endpoint: str, headers_raw: str, resource_raw: str) -> tuple[str, dict[str, str], list[dict]] | None:
+    """Validate and parse raw OTLP config strings into a typed config tuple."""
+    if not endpoint or not headers_raw:
+        return None
+    headers = _parse_otlp_headers(headers_raw)
+    if not headers:
+        return None
+    resource_attrs = _parse_resource_attributes(resource_raw)
+    return endpoint, headers, resource_attrs
+
+
+def _load_otlp_from_file(path: str) -> tuple[str, dict[str, str], list[dict]] | None:
+    """Load OTLP config from a single JSON settings file's env block."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    env_block = data.get("env")
+    if not isinstance(env_block, dict):
+        return None
+    return _resolve_otlp_config(
+        env_block.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+        env_block.get("OTEL_EXPORTER_OTLP_HEADERS", ""),
+        env_block.get("OTEL_RESOURCE_ATTRIBUTES", ""),
+    )
+
+
+def _load_otlp_from_env() -> tuple[str, dict[str, str], list[dict]] | None:
+    """Load OTLP config from current environment variables."""
+    return _resolve_otlp_config(
+        os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+        os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""),
+        os.environ.get("OTEL_RESOURCE_ATTRIBUTES", ""),
+    )
+
+
+def load_otlp_configs() -> list[tuple[str, dict[str, str], list[dict]]]:
+    """Load OTLP destinations based on OTEL_SKILL_HOOK_MODE.
+
+    Modes:
+      env      — use OTEL_* env vars as single destination (default)
+      managed  — read managed-settings.json only
+      personal — read ~/.claude/settings.json only
+      all      — read both config files
+
+    Returns a list of (endpoint, headers_dict, resource_attributes) tuples.
+    Deduplicates by endpoint URL.
+    """
+    mode = os.environ.get("OTEL_SKILL_HOOK_MODE", "env").lower().strip()
+
+    destinations: list[tuple[str, dict[str, str], list[dict]]] = []
+    seen_endpoints: set[str] = set()
+
+    def _add(cfg: tuple[str, dict[str, str], list[dict]] | None) -> None:
+        if cfg is not None:
+            endpoint = cfg[0].rstrip("/")
+            if endpoint not in seen_endpoints:
+                seen_endpoints.add(endpoint)
+                destinations.append(cfg)
+
+    if mode == "env":
+        _add(_load_otlp_from_env())
+    elif mode == "managed":
+        _add(_load_otlp_from_file(_MANAGED_SETTINGS_PATH))
+    elif mode == "personal":
+        _add(_load_otlp_from_file(_DEFAULT_SETTINGS_PATH))
+    elif mode == "all":
+        _add(_load_otlp_from_file(_MANAGED_SETTINGS_PATH))
+        _add(_load_otlp_from_file(_DEFAULT_SETTINGS_PATH))
+    else:
+        # Unknown mode — fall back to env
+        _add(_load_otlp_from_env())
+
+    return destinations
+
+
+# Keep single-destination API for backward compat with tests.
+def load_otlp_config() -> tuple[str, dict[str, str], list[dict]] | None:
+    """Load primary OTLP config. Returns first available destination or None."""
+    configs = load_otlp_configs()
+    return configs[0] if configs else None
+
+
+# --------------------------------------------------------------------------- #
+# OTLP HTTP/JSON send
+# --------------------------------------------------------------------------- #
+
+def _event_to_otlp_attributes(event: dict) -> list[dict]:
+    """Convert the flat event dict to OTLP KeyValue attribute list."""
+    attrs: list[dict] = []
+    for k, v in event.items():
+        if k == "eventType":
+            continue  # not needed in OTLP, it's the log record itself
+        if isinstance(v, bool):
+            attrs.append({"key": k, "value": {"boolValue": v}})
+        elif isinstance(v, int):
+            attrs.append({"key": k, "value": {"intValue": str(v)}})
+        elif isinstance(v, float):
+            attrs.append({"key": k, "value": {"doubleValue": v}})
+        elif isinstance(v, str):
+            attrs.append({"key": k, "value": {"stringValue": v}})
+    return attrs
+
+
+def post_otlp_log(endpoint: str, headers: dict[str, str],
+                  resource_attrs: list[dict], event: dict,
+                  timeout: float = POST_TIMEOUT_S) -> None:
+    """POST event as an OTLP log record via HTTP/JSON to /v1/logs."""
+    # Build resource attributes — always include service.name.
+    all_resource_attrs = list(resource_attrs)
+    if not any(a["key"] == "service.name" for a in all_resource_attrs):
+        all_resource_attrs.insert(0, {
+            "key": "service.name",
+            "value": {"stringValue": "claude-code-hooks"},
+        })
+
+    now_ns = str(int(time.time() * 1_000_000_000))
+    tool_name = event.get("tool_name", "unknown")
+
+    otlp_body = {
+        "resourceLogs": [{
+            "resource": {"attributes": all_resource_attrs},
+            "scopeLogs": [{
+                "scope": {"name": "claude-code-hooks", "version": HOOK_VERSION},
+                "logRecords": [{
+                    "timeUnixNano": now_ns,
+                    "observedTimeUnixNano": now_ns,
+                    "severityNumber": 9,
+                    "severityText": "INFO",
+                    "body": {"stringValue": tool_name},
+                    "attributes": _event_to_otlp_attributes(event),
+                }],
+            }],
+        }],
+    }
+
+    url = endpoint.rstrip("/") + "/v1/logs"
+    body = json.dumps(otlp_body, ensure_ascii=True).encode("utf-8")
+
+    req_headers = {"Content-Type": "application/json"}
+    req_headers.update(headers)
+
+    req = urllib.request.Request(url, data=body, method="POST", headers=req_headers)
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            resp.read()  # drain
+    except (urllib.error.URLError, socket.timeout, ssl.SSLError, ConnectionError):
+        # Silently swallow network errors — telemetry must never disrupt
+        # the developer's workflow.
+        return
+
+
+# --------------------------------------------------------------------------- #
+# Discovery mode (local-only)
+# --------------------------------------------------------------------------- #
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _discovery_write(payload: dict, discovery_dir: str) -> None:
+    """Write one sample payload per unique tool_name, 0600, one-shot.
+
+    Local-only diagnostic — nothing leaves the machine. Gated by the
+    CLAUDE_OTEL_DISCOVERY_DIR env var.
+    """
+    try:
+        tool_name = payload.get("tool_name") or "unknown"
+        if not isinstance(tool_name, str):
+            return
+        safe = _SAFE_NAME_RE.sub("_", tool_name)
+        # Strip leading dots so we never write dotfiles or traversal names.
+        safe = safe.lstrip(".")[:64]
+        if not safe or safe in (".", ".."):
+            return
+        Path(discovery_dir).mkdir(parents=True, exist_ok=True)
+        out = Path(discovery_dir) / f"{safe}.json"
+        # O_EXCL guarantees atomic one-shot write; no pre-check needed.
+        fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------- #
+# Host context helpers
+# --------------------------------------------------------------------------- #
+
+def _get_hostname() -> str:
+    try:
+        return socket.gethostname() or ""
+    except Exception:
+        return ""
+
+
+def _get_repo_name(cwd: str | None) -> str:
+    """Derive a repo name from `git remote get-url origin` basename.
+
+    Best-effort; returns "" on any failure.
+    """
+    if not cwd or not isinstance(cwd, str) or not os.path.isdir(cwd):
+        cwd = os.getcwd()
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+        if r.returncode != 0:
+            return ""
+        url = (r.stdout or "").strip()
+        if not url:
+            return ""
+        name = url.rstrip("/").split("/")[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        return name
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# Host context helpers (shared between event builders)
+# --------------------------------------------------------------------------- #
+
+def _get_user_login() -> str:
+    try:
+        return os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    except Exception:
+        return ""
+
+
+def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: str = "") -> None:
+    """Add hostname, cwd_basename, repo_name, user_login to event in-place."""
+    if not hostname:
+        hostname = _get_hostname()
+    if hostname:
+        event["hostname"] = hostname
+    if cwd:
+        event["cwd_basename"] = os.path.basename(cwd.rstrip("/")) or cwd
+    if not repo:
+        repo = _get_repo_name(cwd)
+    if repo:
+        event["repo_name"] = repo
+    user = _get_user_login()
+    if user:
+        event["user_login"] = user
+
+
+# --------------------------------------------------------------------------- #
+# UserPromptSubmit skill tracking
+# --------------------------------------------------------------------------- #
+
+def _extract_skill_name(prompt: str) -> str:
+    """Extract skill name from '/skill-name args...' format."""
+    stripped = prompt.strip().lstrip("/")
+    return stripped.split()[0] if stripped else ""
+
+
+def _build_skill_event(payload: dict) -> dict | None:
+    """Build an event from a UserPromptSubmit payload for /skill invocations."""
+    prompt = payload.get("prompt", "")
+    if not isinstance(prompt, str) or not prompt.startswith("/"):
+        return None
+
+    skill_name = _extract_skill_name(prompt)
+    if not skill_name:
+        return None
+
+    event: dict[str, object] = {
+        "eventType": EVENT_TYPE,
+        "timestamp": int(time.time() * 1000),
+        "hook_version": HOOK_VERSION,
+        "tool_name": "Skill",
+        "tool_category": "skill",
+        "skill": skill_name,
+        "hook_event_name": "UserPromptSubmit",
+    }
+
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        event["session_id"] = session_id
+
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    _add_host_context(event, cwd)
+
+    return {k: v for k, v in event.items() if k in ALLOWED_FIELDS}
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+def _is_skill_payload(payload: dict) -> bool:
+    """Detect UserPromptSubmit payloads (have 'prompt', no 'tool_name')."""
+    return (
+        "prompt" in payload
+        and "tool_name" not in payload
+        and isinstance(payload.get("prompt"), str)
+        and payload["prompt"].startswith("/")
+    )
+
+
+def process_hook(payload: dict) -> dict | None:
+    """Pure-ish orchestrator: build event + send if configured.
+
+    Handles both PreToolUse (tool_name) and UserPromptSubmit (prompt) payloads.
+    Returns the built event dict (for tests). Does NOT re-raise on errors.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return None
+
+        # Route based on payload type.
+        if _is_skill_payload(payload):
+            event = _build_skill_event(payload)
+        else:
+            if not should_track(payload.get("tool_name")):
+                return None
+            discovery_dir = os.environ.get("CLAUDE_OTEL_DISCOVERY_DIR")
+            if discovery_dir:
+                _discovery_write(payload, discovery_dir)
+            event = build_event(payload)
+
+        if not event:
+            return None
+
+        destinations = load_otlp_configs()
+        if not destinations:
+            return event  # nothing to do; return the event for testing
+        for endpoint, headers, resource_attrs in destinations:
+            post_otlp_log(endpoint, headers, resource_attrs, event)
+        return event
+    except Exception:
+        return None
+
+
+def _fork_send(payload: dict) -> None:
+    """Fork a detached child to run process_hook so the parent returns fast."""
+    try:
+        pid = os.fork()
+    except (OSError, AttributeError):
+        process_hook(payload)
+        return
+    if pid != 0:
+        return
+    # Child
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    try:
+        process_hook(payload)
+    finally:
+        os._exit(0)
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read(256 * 1024)  # 256 KB cap
+        if not raw:
+            return 0
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        # Accept both PreToolUse (tool_name) and UserPromptSubmit (prompt) payloads.
+        if _is_skill_payload(payload):
+            _fork_send(payload)
+        elif should_track(payload.get("tool_name")):
+            _fork_send(payload)
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
