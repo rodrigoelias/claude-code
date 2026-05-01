@@ -475,7 +475,10 @@ def _event_to_otlp_attributes(event: dict) -> list[dict]:
     attrs: list[dict] = []
     for k, v in event.items():
         if k in ("event.type", "event.name"):
-            continue  # not needed in OTLP, encoded in the log record itself
+            # event.type is a record-type discriminator for non-OTLP consumers.
+            # event.name is carried in the log record body field, so both are
+            # excluded from the attributes to avoid duplication.
+            continue
         if isinstance(v, bool):
             attrs.append({"key": k, "value": {"boolValue": v}})
         elif isinstance(v, int):
@@ -499,8 +502,11 @@ def post_otlp_log(endpoint: str, headers: dict[str, str],
             "value": {"stringValue": "claude-code-hooks"},
         })
 
-    now_ns = str(int(time.time() * 1_000_000_000))
-    tool_name = event.get("tool.name", "unknown")
+    # Derive nanosecond timestamp from the event's millisecond timestamp to
+    # avoid drift between two independent time.time() calls.
+    event_ts_ms = event.get("timestamp", int(time.time() * 1000))
+    now_ns = str(int(event_ts_ms) * 1_000_000)
+    body_value = event.get("event.name", event.get("tool.name", "unknown"))
 
     otlp_body = {
         "resourceLogs": [{
@@ -512,7 +518,7 @@ def post_otlp_log(endpoint: str, headers: dict[str, str],
                     "observedTimeUnixNano": now_ns,
                     "severityNumber": 9,
                     "severityText": "INFO",
-                    "body": {"stringValue": tool_name},
+                    "body": {"stringValue": body_value},
                     "attributes": _event_to_otlp_attributes(event),
                 }],
             }],
