@@ -127,7 +127,7 @@ class TestMetadataAllowlist(unittest.TestCase):
     def test_cwd_basename_only(self):
         payload = make_payload("Bash", {"command": "ls"})
         ev = hook.build_event(payload)
-        self.assertEqual(ev.get("cwd_basename"), "super-secret-project")
+        self.assertEqual(ev.get("workspace.name"), "super-secret-project")
         self.assertNotIn("/home/alice", self._serialized(ev))
 
     def test_unicode_binary_junk(self):
@@ -159,8 +159,8 @@ class TestMetadataAllowlist(unittest.TestCase):
             self.assertNotIn("leak this", s)
             self.assertNotIn("command", ev)
             self.assertNotIn("prompt", ev)
-            self.assertEqual(ev.get("skill"), "create-commit")
-            self.assertEqual(ev.get("skill_args_sanitized"), "Fix bug")
+            self.assertEqual(ev.get("skill.name"), "create-commit")
+            self.assertEqual(ev.get("skill.args_sanitized"), "Fix bug")
 
     def test_agent_happy_path(self):
         payload = make_payload("Agent", {
@@ -170,8 +170,8 @@ class TestMetadataAllowlist(unittest.TestCase):
             "model": "sonnet",
         })
         ev = hook.build_event(payload)
-        self.assertEqual(ev.get("subagent_type"), "Explore")
-        self.assertEqual(ev.get("agent_model"), "sonnet")
+        self.assertEqual(ev.get("agent.subagent_type"), "Explore")
+        self.assertEqual(ev.get("agent.model"), "sonnet")
         self.assertNotIn("abcdef", self._serialized(ev))
 
     def test_skill_happy_path(self):
@@ -180,8 +180,8 @@ class TestMetadataAllowlist(unittest.TestCase):
             "args": "Fix auth bug in login flow",
         })
         ev = hook.build_event(payload)
-        self.assertEqual(ev.get("skill"), "create-commit")
-        self.assertEqual(ev.get("skill_args_sanitized"), "Fix auth bug in login flow")
+        self.assertEqual(ev.get("skill.name"), "create-commit")
+        self.assertEqual(ev.get("skill.args_sanitized"), "Fix auth bug in login flow")
 
     def test_webfetch_url_blocked(self):
         payload = make_payload("WebFetch", {
@@ -317,7 +317,7 @@ class TestPayloadSafety(unittest.TestCase):
 
     def test_empty_tool_input(self):
         ev = hook.build_event(make_payload("Bash", {}))
-        self.assertEqual(ev["tool_name"], "Bash")
+        self.assertEqual(ev["tool.name"], "Bash")
 
     def test_null_fields(self):
         payload = {
@@ -327,9 +327,9 @@ class TestPayloadSafety(unittest.TestCase):
             "cwd": None,
         }
         ev = hook.build_event(payload)
-        self.assertEqual(ev["tool_name"], "Bash")
-        self.assertNotIn("session_id", ev)
-        self.assertNotIn("cwd_basename", ev)
+        self.assertEqual(ev["tool.name"], "Bash")
+        self.assertNotIn("session.id", ev)
+        self.assertNotIn("workspace.name", ev)
 
     def test_deeply_nested_tool_input_ignored(self):
         nested = {"a": 1}
@@ -533,7 +533,7 @@ class TestNonBlocking(unittest.TestCase):
         with mock.patch.object(hook, "load_otlp_configs", return_value=[]):
             ev = hook.process_hook(make_payload("Bash", {"command": "ls"}))
         self.assertIsNotNone(ev)
-        self.assertEqual(ev["tool_name"], "Bash")
+        self.assertEqual(ev["tool.name"], "Bash")
 
     def test_post_otlp_log_swallows_network_errors(self):
         # Point at an unroutable address; should return without raising.
@@ -561,7 +561,7 @@ class TestNonBlocking(unittest.TestCase):
 class TestEventSchema(unittest.TestCase):
     def test_eventtype_present(self):
         ev = hook.build_event(make_payload("Bash", {"command": "ls"}))
-        self.assertEqual(ev["eventType"], "ClaudeCodeToolUse")
+        self.assertEqual(ev["event.type"], "ClaudeCodeToolUse")
 
     def test_timestamp_is_epoch_ms(self):
         ev = hook.build_event(make_payload("Bash", {"command": "ls"}))
@@ -617,17 +617,17 @@ class TestToolCategory(unittest.TestCase):
 class TestPluginIdentity(unittest.TestCase):
     def test_mcp_split(self):
         out = hook.parse_tool_name("mcp__github__search_code")
-        self.assertEqual(out["mcp_plugin"], "github")
-        self.assertEqual(out["mcp_tool"], "search_code")
+        self.assertEqual(out["mcp.plugin"], "github")
+        self.assertEqual(out["mcp.tool"], "search_code")
 
     def test_mcp_tool_with_underscores(self):
         out = hook.parse_tool_name("mcp__github__add_issue_comment")
-        self.assertEqual(out["mcp_plugin"], "github")
-        self.assertEqual(out["mcp_tool"], "add_issue_comment")
+        self.assertEqual(out["mcp.plugin"], "github")
+        self.assertEqual(out["mcp.tool"], "add_issue_comment")
 
     def test_skill_paren(self):
         out = hook.parse_tool_name("Skill(pdf-extractor)")
-        self.assertEqual(out["skill_name_hint"], "pdf-extractor")
+        self.assertEqual(out["skill.name_hint"], "pdf-extractor")
 
     def test_no_metadata(self):
         out = hook.parse_tool_name("Bash")
@@ -639,13 +639,13 @@ class TestPluginIdentity(unittest.TestCase):
         payload["plugin_version"] = "1.2.3"
         payload["source"] = "managed"
         ev = hook.build_event(payload)
-        self.assertEqual(ev["plugin_name"], "foo")
-        self.assertEqual(ev["plugin_version"], "1.2.3")
+        self.assertEqual(ev["plugin.name"], "foo")
+        self.assertEqual(ev["plugin.version"], "1.2.3")
         self.assertEqual(ev["source"], "managed")
 
     def test_missing_metadata_no_crash(self):
         ev = hook.build_event(make_payload("Bash", {"command": "ls"}))
-        self.assertNotIn("plugin_name", ev)
+        self.assertNotIn("plugin.name", ev)
 
 
 # --------------------------------------------------------------------------- #
@@ -786,12 +786,12 @@ class TestBuildSkillEvent(unittest.TestCase):
         payload = {"prompt": "/commit -m fix", "session_id": "s1", "cwd": "/home/user/proj"}
         event = hook._build_skill_event(payload)
         self.assertIsNotNone(event)
-        self.assertEqual(event["tool_name"], "Skill")
-        self.assertEqual(event["tool_category"], "skill")
-        self.assertEqual(event["skill"], "commit")
-        self.assertEqual(event["hook_event_name"], "UserPromptSubmit")
-        self.assertEqual(event["session_id"], "s1")
-        self.assertEqual(event["cwd_basename"], "proj")
+        self.assertEqual(event["tool.name"], "Skill")
+        self.assertEqual(event["tool.category"], "skill")
+        self.assertEqual(event["skill.name"], "commit")
+        self.assertEqual(event["hook.event_name"], "UserPromptSubmit")
+        self.assertEqual(event["session.id"], "s1")
+        self.assertEqual(event["workspace.name"], "proj")
 
     def test_non_slash_returns_none(self):
         self.assertIsNone(hook._build_skill_event({"prompt": "hello"}))
@@ -821,7 +821,7 @@ class TestProcessHookSkill(unittest.TestCase):
         payload = {"prompt": "/diagnose this bug", "session_id": "s1", "cwd": "/tmp"}
         event = hook.process_hook(payload)
         self.assertIsNotNone(event)
-        self.assertEqual(event["skill"], "diagnose")
+        self.assertEqual(event["skill.name"], "diagnose")
         mock_post.assert_called_once()
 
     def test_skill_payload_no_config_returns_event(self):
@@ -833,7 +833,7 @@ class TestProcessHookSkill(unittest.TestCase):
             payload = {"prompt": "/caveman", "session_id": "s1"}
             event = hook.process_hook(payload)
             self.assertIsNotNone(event)
-            self.assertEqual(event["skill"], "caveman")
+            self.assertEqual(event["skill.name"], "caveman")
 
 
 class TestMainSkillPayload(unittest.TestCase):
@@ -911,28 +911,55 @@ class TestSchemaContract(unittest.TestCase):
     def test_conditional_fields_absent_when_irrelevant(self):
         # Bash event should NOT have skill/mcp/agent fields
         bash_event = hook.build_event(make_payload("Bash", {"command": "ls"}))
-        for field in ("skill", "mcp_plugin", "mcp_tool", "subagent_type",
-                      "agent_model", "skill_name_hint", "skill_args_sanitized"):
+        for field in ("skill.name", "mcp.plugin", "mcp.tool", "agent.subagent_type",
+                      "agent.model", "skill.name_hint", "skill.args_sanitized"):
             self.assertNotIn(field, bash_event, f"'{field}' should not be in Bash event")
 
         # Skill event should NOT have mcp/agent fields
         skill_event = hook.build_event(make_payload("Skill", {"skill": "commit", "args": "fix"}))
-        for field in ("mcp_plugin", "mcp_tool", "subagent_type", "agent_model"):
+        for field in ("mcp.plugin", "mcp.tool", "agent.subagent_type", "agent.model"):
             self.assertNotIn(field, skill_event, f"'{field}' should not be in Skill event")
 
         # Agent event should NOT have mcp/skill fields
         agent_event = hook.build_event(
             make_payload("Agent", {"subagent_type": "Explore", "model": "sonnet", "prompt": "x"})
         )
-        for field in ("mcp_plugin", "mcp_tool", "skill", "skill_args_sanitized"):
+        for field in ("mcp.plugin", "mcp.tool", "skill.name", "skill.args_sanitized"):
             self.assertNotIn(field, agent_event, f"'{field}' should not be in Agent event")
 
     def test_removing_field_from_schema_breaks_build(self):
-        patched_schema = {k: v for k, v in hook.SCHEMA.items() if k != "tool_name"}
+        patched_schema = {k: v for k, v in hook.SCHEMA.items() if k != "tool.name"}
         with mock.patch.object(hook, "SCHEMA", patched_schema), \
              mock.patch.object(hook, "ALLOWED_FIELDS", frozenset(patched_schema.keys())):
             event = hook.build_event(make_payload("Bash", {"command": "ls"}))
-        self.assertNotIn("tool_name", event)
+        self.assertNotIn("tool.name", event)
+
+
+# --------------------------------------------------------------------------- #
+# TestOtelV2Fields — new fields added in v2
+# --------------------------------------------------------------------------- #
+
+
+class TestOtelV2Fields(unittest.TestCase):
+    def test_event_name_present(self):
+        ev = hook.build_event(make_payload("Bash", {"command": "ls"}))
+        self.assertEqual(ev["event.name"], "claude_code_hooks.tool_use")
+
+    def test_skill_event_name(self):
+        payload = {"prompt": "/commit -m fix", "session_id": "s1", "cwd": "/tmp"}
+        event = hook._build_skill_event(payload)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event.name"], "claude_code_hooks.skill_invoke")
+
+    def test_tool_use_id_copied(self):
+        payload = make_payload("Bash", {"command": "ls"})
+        payload["tool_use_id"] = "toolu_abc123"
+        ev = hook.build_event(payload)
+        self.assertEqual(ev["tool.use_id"], "toolu_abc123")
+
+    def test_tool_use_id_absent_when_missing(self):
+        ev = hook.build_event(make_payload("Bash", {"command": "ls"}))
+        self.assertNotIn("tool.use_id", ev)
 
 
 if __name__ == "__main__":

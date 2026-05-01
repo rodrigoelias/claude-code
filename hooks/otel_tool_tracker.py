@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HOOK_VERSION = "1"
+HOOK_VERSION = "2"
 EVENT_TYPE = "ClaudeCodeToolUse"
 ARGS_MAX_LEN = 512
 POST_TIMEOUT_S = 3.0
@@ -48,35 +48,39 @@ class FieldSpec:
 
 SCHEMA: dict[str, FieldSpec] = {
     # Envelope (always present)
-    "eventType":           FieldSpec("str", "always", ""),
+    "event.type":          FieldSpec("str", "always", ""),
+    "event.name":          FieldSpec("str", "always", ""),
     "timestamp":           FieldSpec("int", "always", ""),
-    "hook_version":        FieldSpec("str", "always", ""),
+    "hook.version":        FieldSpec("str", "always", ""),
     # Tool identity (always present)
-    "tool_name":           FieldSpec("str", "always", ""),
-    "tool_category":       FieldSpec("str", "always", ""),
-    "hook_event_name":     FieldSpec("str", "conditional", "present in payload"),
+    "tool.name":           FieldSpec("str", "always", ""),
+    "tool.category":       FieldSpec("str", "always", ""),
+    "hook.event_name":     FieldSpec("str", "conditional", "present in payload"),
     # Plugin / skill identity
-    "plugin_name":         FieldSpec("str", "conditional", "present in payload"),
-    "plugin_version":      FieldSpec("str", "conditional", "present in payload"),
+    "plugin.name":         FieldSpec("str", "conditional", "present in payload"),
+    "plugin.version":      FieldSpec("str", "conditional", "present in payload"),
     "source":              FieldSpec("str", "conditional", "present in payload"),
-    "mcp_plugin":          FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
-    "mcp_tool":            FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
-    "skill_name_hint":     FieldSpec("str", "conditional", "tool_name matches 'Skill(...)'"),
+    "mcp.plugin":          FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
+    "mcp.tool":            FieldSpec("str", "conditional", "tool_name starts with 'mcp__'"),
+    "skill.name_hint":     FieldSpec("str", "conditional", "tool_name matches 'Skill(...)'"),
     # Narrow tool_input sub-keys
-    "subagent_type":       FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
-    "agent_model":         FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
-    "skill":               FieldSpec("str", "conditional", "tool_name == 'Skill' or UserPromptSubmit"),
-    "skill_args_sanitized":FieldSpec("str", "conditional", "tool_name == 'Skill' and args present"),
+    "agent.subagent_type": FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
+    "agent.model":         FieldSpec("str", "conditional", "tool_name in ('Agent', 'Task')"),
+    "skill.name":          FieldSpec("str", "conditional", "tool_name == 'Skill' or UserPromptSubmit"),
+    "skill.args_sanitized":FieldSpec("str", "conditional", "tool_name == 'Skill' and args present"),
     # Session / agent context
-    "session_id":          FieldSpec("str", "conditional", "present in payload"),
-    "agent_id":            FieldSpec("str", "conditional", "present in payload"),
-    "agent_type":          FieldSpec("str", "conditional", "present in payload"),
-    "permission_mode":     FieldSpec("str", "conditional", "present in payload"),
+    "session.id":          FieldSpec("str", "conditional", "present in payload"),
+    "tool.use_id":         FieldSpec("str", "conditional", "present in payload as tool_use_id"),
+    "agent.id":            FieldSpec("str", "conditional", "present in payload"),
+    "agent.type":          FieldSpec("str", "conditional", "present in payload"),
+    "session.permission_mode": FieldSpec("str", "conditional", "present in payload"),
+    # Prompt correlation
+    "prompt.id":           FieldSpec("str", "conditional", "cached prompt ID exists for session"),
     # Host context
-    "cwd_basename":        FieldSpec("str", "conditional", "cwd present in payload"),
-    "hostname":            FieldSpec("str", "conditional", "hostname resolvable"),
-    "repo_name":           FieldSpec("str", "conditional", "git remote origin exists"),
-    "user_login":          FieldSpec("str", "conditional", "$USER or $USERNAME set"),
+    "workspace.name":      FieldSpec("str", "conditional", "cwd present in payload"),
+    "host.name":           FieldSpec("str", "conditional", "hostname resolvable"),
+    "repo.name":           FieldSpec("str", "conditional", "git remote origin exists"),
+    "user.login":          FieldSpec("str", "conditional", "$USER or $USERNAME set"),
 }
 
 # --------------------------------------------------------------------------- #
@@ -208,8 +212,8 @@ _SKILL_PAREN_RE = re.compile(r"^Skill\(([^)]+)\)$")
 def parse_tool_name(tool_name: str) -> dict[str, str]:
     """Extract plugin/skill identifiers encoded in tool_name itself.
 
-    mcp__<plugin>__<tool> -> {"mcp_plugin", "mcp_tool"}
-    Skill(<name>)         -> {"skill_name_hint"}
+    mcp__<plugin>__<tool> -> {"mcp.plugin", "mcp.tool"}
+    Skill(<name>)         -> {"skill.name_hint"}
     """
     out: dict[str, str] = {}
     if not isinstance(tool_name, str):
@@ -219,13 +223,13 @@ def parse_tool_name(tool_name: str) -> dict[str, str]:
         # Split on the literal "__" separator. Format: mcp__<plugin>__<tool>
         parts = tool_name.split("__", 2)
         if len(parts) == 3 and parts[1] and parts[2]:
-            out["mcp_plugin"] = parts[1]
-            out["mcp_tool"] = parts[2]
+            out["mcp.plugin"] = parts[1]
+            out["mcp.tool"] = parts[2]
         return out
 
     m = _SKILL_PAREN_RE.match(tool_name)
     if m:
-        out["skill_name_hint"] = m.group(1)
+        out["skill.name_hint"] = m.group(1)
     return out
 
 
@@ -233,10 +237,17 @@ def parse_tool_name(tool_name: str) -> dict[str, str]:
 # build_event
 # --------------------------------------------------------------------------- #
 
-_ROOT_COPY_KEYS = (
-    "session_id", "agent_id", "agent_type", "permission_mode",
-    "hook_event_name", "plugin_name", "plugin_version", "source",
-)
+_ROOT_KEY_MAP = {
+    "session_id": "session.id",
+    "tool_use_id": "tool.use_id",
+    "agent_id": "agent.id",
+    "agent_type": "agent.type",
+    "permission_mode": "session.permission_mode",
+    "hook_event_name": "hook.event_name",
+    "plugin_name": "plugin.name",
+    "plugin_version": "plugin.version",
+    "source": "source",
+}
 
 
 def _coerce_scalar(v: object) -> object:
@@ -268,17 +279,18 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
     assert isinstance(tool_name, str)  # narrowed by should_track
 
     event: dict[str, object] = {
-        "eventType": EVENT_TYPE,
+        "event.type": EVENT_TYPE,
+        "event.name": "claude_code_hooks.tool_use",
         "timestamp": int(time.time() * 1000),
-        "hook_version": HOOK_VERSION,
-        "tool_name": tool_name,
-        "tool_category": tool_category(tool_name),
+        "hook.version": HOOK_VERSION,
+        "tool.name": tool_name,
+        "tool.category": tool_category(tool_name),
     }
 
-    for k in _ROOT_COPY_KEYS:
-        v = _coerce_scalar(payload.get(k))
+    for payload_key, attr_name in _ROOT_KEY_MAP.items():
+        v = _coerce_scalar(payload.get(payload_key))
         if v is not None and v != "":
-            event[k] = v
+            event[attr_name] = v
 
     event.update(parse_tool_name(tool_name))
 
@@ -300,25 +312,25 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
             raw_val = tool_input.get(subkey)
 
             if tool_name == "Skill" and subkey == "args":
-                event["skill_args_sanitized"] = sanitize_args(raw_val)
+                event["skill.args_sanitized"] = sanitize_args(raw_val)
                 continue
 
             if tool_name == "Skill" and subkey == "skill":
                 v = _coerce_scalar(raw_val)
                 if isinstance(v, str) and v:
-                    event["skill"] = v
+                    event["skill.name"] = v
                 continue
 
             if tool_name in ("Agent", "Task") and subkey == "model":
                 v = _coerce_scalar(raw_val)
                 if isinstance(v, str) and v:
-                    event["agent_model"] = v
+                    event["agent.model"] = v
                 continue
 
             if tool_name in ("Agent", "Task") and subkey == "subagent_type":
                 v = _coerce_scalar(raw_val)
                 if isinstance(v, str) and v:
-                    event["subagent_type"] = v
+                    event["agent.subagent_type"] = v
                 continue
 
     # Final enforcement: drop any key that slipped in outside the allowlist.
@@ -454,8 +466,8 @@ def _event_to_otlp_attributes(event: dict) -> list[dict]:
     """Convert the flat event dict to OTLP KeyValue attribute list."""
     attrs: list[dict] = []
     for k, v in event.items():
-        if k == "eventType":
-            continue  # not needed in OTLP, it's the log record itself
+        if k in ("event.type", "event.name"):
+            continue  # not needed in OTLP, encoded in the log record itself
         if isinstance(v, bool):
             attrs.append({"key": k, "value": {"boolValue": v}})
         elif isinstance(v, int):
@@ -480,7 +492,7 @@ def post_otlp_log(endpoint: str, headers: dict[str, str],
         })
 
     now_ns = str(int(time.time() * 1_000_000_000))
-    tool_name = event.get("tool_name", "unknown")
+    tool_name = event.get("tool.name", "unknown")
 
     otlp_body = {
         "resourceLogs": [{
@@ -598,20 +610,20 @@ def _get_user_login() -> str:
 
 
 def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: str = "") -> None:
-    """Add hostname, cwd_basename, repo_name, user_login to event in-place."""
+    """Add host.name, workspace.name, repo.name, user.login to event in-place."""
     if not hostname:
         hostname = _get_hostname()
     if hostname:
-        event["hostname"] = hostname
+        event["host.name"] = hostname
     if cwd:
-        event["cwd_basename"] = os.path.basename(cwd.rstrip("/")) or cwd
+        event["workspace.name"] = os.path.basename(cwd.rstrip("/")) or cwd
     if not repo:
         repo = _get_repo_name(cwd)
     if repo:
-        event["repo_name"] = repo
+        event["repo.name"] = repo
     user = _get_user_login()
     if user:
-        event["user_login"] = user
+        event["user.login"] = user
 
 
 # --------------------------------------------------------------------------- #
@@ -635,18 +647,19 @@ def _build_skill_event(payload: dict) -> dict | None:
         return None
 
     event: dict[str, object] = {
-        "eventType": EVENT_TYPE,
+        "event.type": EVENT_TYPE,
+        "event.name": "claude_code_hooks.skill_invoke",
         "timestamp": int(time.time() * 1000),
-        "hook_version": HOOK_VERSION,
-        "tool_name": "Skill",
-        "tool_category": "skill",
-        "skill": skill_name,
-        "hook_event_name": "UserPromptSubmit",
+        "hook.version": HOOK_VERSION,
+        "tool.name": "Skill",
+        "tool.category": "skill",
+        "skill.name": skill_name,
+        "hook.event_name": "UserPromptSubmit",
     }
 
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id:
-        event["session_id"] = session_id
+        event["session.id"] = session_id
 
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     _add_host_context(event, cwd)
