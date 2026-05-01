@@ -207,6 +207,7 @@ def tool_category(tool_name: str) -> str:
 
 
 _SKILL_PAREN_RE = re.compile(r"^Skill\(([^)]+)\)$")
+_SAFE_SESSION_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def parse_tool_name(tool_name: str) -> dict[str, str]:
@@ -291,6 +292,13 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
         v = _coerce_scalar(payload.get(payload_key))
         if v is not None and v != "":
             event[attr_name] = v
+
+    # Prompt correlation.
+    sid = event.get("session.id")
+    if sid:
+        pid = _read_cached_prompt_id(sid)
+        if pid:
+            event["prompt.id"] = pid
 
     event.update(parse_tool_name(tool_name))
 
@@ -627,6 +635,68 @@ def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: st
 
 
 # --------------------------------------------------------------------------- #
+# Prompt ID correlation
+# --------------------------------------------------------------------------- #
+
+
+def _tail_lines(path: str, n: int = 50, chunk: int = 8192) -> list[str]:
+    """Read the last n lines of a file by seeking from the end."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        buf = b""
+        while size > 0 and buf.count(b"\n") <= n:
+            step = min(chunk, size)
+            size -= step
+            f.seek(size)
+            buf = f.read(step) + buf
+    return buf.decode("utf-8", "replace").splitlines()[-n:]
+
+
+def _cache_prompt_id(payload: dict) -> None:
+    """Extract promptId from transcript and cache to /tmp for correlation."""
+    try:
+        transcript_path = payload.get("transcript_path")
+        session_id = payload.get("session_id")
+        if not transcript_path or not session_id or not isinstance(transcript_path, str):
+            return
+        if not isinstance(session_id, str) or not _SAFE_SESSION_RE.match(session_id):
+            return
+        lines = _tail_lines(transcript_path, 50)
+        for line in reversed(lines):
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "user" and obj.get("promptId"):
+                    prompt_id = str(obj["promptId"]).strip()
+                    if not prompt_id:
+                        return
+                    tmp_path = f"/tmp/claude_otel_prompt_{session_id}.tmp"
+                    final_path = f"/tmp/claude_otel_prompt_{session_id}"
+                    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w") as wf:
+                        wf.write(prompt_id)
+                    os.rename(tmp_path, final_path)
+                    return
+            except (ValueError, KeyError):
+                continue
+    except Exception:
+        pass
+
+
+def _read_cached_prompt_id(session_id: str) -> str | None:
+    """Read cached prompt_id for the given session."""
+    try:
+        if not isinstance(session_id, str) or not _SAFE_SESSION_RE.match(session_id):
+            return None
+        path = f"/tmp/claude_otel_prompt_{session_id}"
+        with open(path, "r") as f:
+            value = f.read().strip()
+        return value if value else None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # UserPromptSubmit skill tracking
 # --------------------------------------------------------------------------- #
 
@@ -660,6 +730,9 @@ def _build_skill_event(payload: dict) -> dict | None:
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id:
         event["session.id"] = session_id
+        pid = _read_cached_prompt_id(session_id)
+        if pid:
+            event["prompt.id"] = pid
 
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     _add_host_context(event, cwd)
@@ -690,6 +763,10 @@ def process_hook(payload: dict) -> dict | None:
     try:
         if not isinstance(payload, dict):
             return None
+
+        # Cache prompt_id from UserPromptSubmit payloads.
+        if payload.get("hook_event_name") == "UserPromptSubmit":
+            _cache_prompt_id(payload)
 
         # Route based on payload type.
         if _is_skill_payload(payload):

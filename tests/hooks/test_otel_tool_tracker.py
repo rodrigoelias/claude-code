@@ -7,6 +7,7 @@ no network calls, hermetic.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -933,6 +934,63 @@ class TestSchemaContract(unittest.TestCase):
              mock.patch.object(hook, "ALLOWED_FIELDS", frozenset(patched_schema.keys())):
             event = hook.build_event(make_payload("Bash", {"command": "ls"}))
         self.assertNotIn("tool.name", event)
+
+
+# --------------------------------------------------------------------------- #
+# TestPromptIdCorrelation — prompt ID caching and correlation
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptIdCorrelation(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        # Clean up /tmp files
+        for f in glob.glob("/tmp/claude_otel_prompt_test_*"):
+            os.unlink(f)
+
+    def test_cache_prompt_id_writes_file(self):
+        transcript = os.path.join(self.tmp_dir, "transcript.jsonl")
+        with open(transcript, "w") as f:
+            f.write(json.dumps({"type": "user", "promptId": "prompt-abc-123"}) + "\n")
+        payload = {"transcript_path": transcript, "session_id": "test_sess1"}
+        hook._cache_prompt_id(payload)
+        with open("/tmp/claude_otel_prompt_test_sess1") as f:
+            self.assertEqual(f.read(), "prompt-abc-123")
+
+    def test_read_cached_prompt_id(self):
+        with open("/tmp/claude_otel_prompt_test_sess2", "w") as f:
+            f.write("prompt-xyz-789")
+        result = hook._read_cached_prompt_id("test_sess2")
+        self.assertEqual(result, "prompt-xyz-789")
+
+    def test_read_missing_returns_none(self):
+        self.assertIsNone(hook._read_cached_prompt_id("test_nonexistent_session"))
+
+    def test_unsafe_session_id_rejected(self):
+        self.assertIsNone(hook._read_cached_prompt_id("../etc/passwd"))
+        self.assertIsNone(hook._read_cached_prompt_id("foo/bar"))
+
+    def test_prompt_id_in_build_event(self):
+        # Pre-cache a prompt ID
+        with open("/tmp/claude_otel_prompt_test_sess3", "w") as f:
+            f.write("prompt-in-event")
+        payload = make_payload("Bash", {"command": "ls"})
+        payload["session_id"] = "test_sess3"
+        event = hook.build_event(payload)
+        self.assertEqual(event.get("prompt.id"), "prompt-in-event")
+
+    def test_tail_lines_reads_last_n(self):
+        path = os.path.join(self.tmp_dir, "big.txt")
+        with open(path, "w") as f:
+            for i in range(100):
+                f.write(f"line {i}\n")
+        lines = hook._tail_lines(path, n=5)
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[-1], "line 99")
 
 
 # --------------------------------------------------------------------------- #
