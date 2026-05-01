@@ -646,17 +646,23 @@ def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: st
 
 
 def _tail_lines(path: str, n: int = 50, chunk: int = 8192) -> list[str]:
-    """Read the last n lines of a file by seeking from the end."""
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        size = f.tell()
-        buf = b""
-        while size > 0 and buf.count(b"\n") <= n:
-            step = min(chunk, size)
-            size -= step
-            f.seek(size)
-            buf = f.read(step) + buf
-    return buf.decode("utf-8", "replace").splitlines()[-n:]
+    """Read the last n lines of a file by seeking from the end.
+
+    Returns [] on any I/O error (file missing, permissions, etc.).
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            buf = b""
+            while size > 0 and buf.count(b"\n") <= n:
+                step = min(chunk, size)
+                size -= step
+                f.seek(size)
+                buf = f.read(step) + buf
+        return buf.decode("utf-8", "replace").splitlines()[-n:]
+    except (OSError, ValueError):
+        return []
 
 
 def _cache_prompt_id(payload: dict) -> None:

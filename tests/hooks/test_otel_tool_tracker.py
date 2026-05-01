@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -946,10 +947,10 @@ class TestPromptIdCorrelation(unittest.TestCase):
         self.tmp_dir = tempfile.mkdtemp()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        # Clean up /tmp files
-        for f in glob.glob("/tmp/claude_otel_prompt_test_*"):
+        # Clean up cached prompt files
+        tmp_dir = tempfile.gettempdir()
+        for f in glob.glob(os.path.join(tmp_dir, "claude_otel_prompt_test_*")):
             os.unlink(f)
 
     def test_cache_prompt_id_writes_file(self):
@@ -991,6 +992,38 @@ class TestPromptIdCorrelation(unittest.TestCase):
         lines = hook._tail_lines(path, n=5)
         self.assertEqual(len(lines), 5)
         self.assertEqual(lines[-1], "line 99")
+
+    def test_tail_lines_missing_file_returns_empty(self):
+        lines = hook._tail_lines("/nonexistent/path/file.jsonl")
+        self.assertEqual(lines, [])
+
+    @mock.patch.object(hook, "load_otlp_configs", return_value=[])
+    def test_end_to_end_prompt_correlation(self, _):
+        """Full flow: UserPromptSubmit caches prompt ID, subsequent PreToolUse reads it."""
+        session_id = "test_e2e_correlation"
+        # Create a transcript file with a promptId
+        transcript = os.path.join(self.tmp_dir, "transcript.jsonl")
+        with open(transcript, "w") as f:
+            f.write(json.dumps({"type": "user", "promptId": "prompt-e2e-42"}) + "\n")
+
+        # Step 1: process a UserPromptSubmit payload (caches prompt ID)
+        submit_payload = {
+            "prompt": "/commit",
+            "session_id": session_id,
+            "hook_event_name": "UserPromptSubmit",
+            "transcript_path": transcript,
+            "cwd": "/tmp",
+        }
+        hook.process_hook(submit_payload)
+
+        # Step 2: process a PreToolUse payload for the same session
+        tool_payload = make_payload("Edit", {"file_path": "x.py"})
+        tool_payload["session_id"] = session_id
+        event = hook.process_hook(tool_payload)
+
+        # The tool event should carry the cached prompt.id
+        self.assertIsNotNone(event)
+        self.assertEqual(event.get("prompt.id"), "prompt-e2e-42")
 
 
 # --------------------------------------------------------------------------- #
