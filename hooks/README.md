@@ -99,17 +99,28 @@ The authoritative schema definition lives in `otel_tool_tracker.py` as the `SCHE
 To add a field: add an entry to `SCHEMA` and emit it in `build_event` / `_build_skill_event`.  
 To remove a field: delete its entry from `SCHEMA` — tests will catch any code that still emits it.
 
-Key fields:
+### Event types
+
+| `event.name` | Trigger | Description |
+|---|---|---|
+| `claude_code_hooks.tool_use` | PreToolUse | Claude called a tool |
+| `claude_code_hooks.skill_invoke` | UserPromptSubmit | User invoked a /slash-command |
+
+### Key fields
 
 | Field | Type | Presence | Notes |
 |---|---|---|---|
-| `eventType` | str | always | `ClaudeCodeToolUse` |
+| `event.type` | str | always | `ClaudeCodeToolUse` |
+| `event.name` | str | always | Event type discriminator (see above) |
 | `timestamp` | int | always | epoch milliseconds |
-| `tool_name` | str | always | e.g., `Edit`, `Agent`, `mcp__github__search_code` |
-| `tool_category` | str | always | `mutation`, `skill`, `agent`, `mcp`, `other` |
-| `skill` | str | conditional | Skill tool or /slash-command name |
-| `subagent_type` | str | conditional | Agent/Task subagent type |
-| `mcp_plugin` | str | conditional | MCP server name parsed from tool_name |
+| `hook.version` | str | always | `"2"` |
+| `tool.name` | str | always | e.g., `Edit`, `Agent`, `mcp__github__search_code` |
+| `tool.category` | str | always | `mutation`, `skill`, `agent`, `mcp`, `other` |
+| `tool.use_id` | str | conditional | Claude's correlation ID |
+| `prompt.id` | str | conditional | Cached prompt ID for cross-event correlation |
+| `skill.name` | str | conditional | Skill tool or /slash-command name |
+| `agent.subagent_type` | str | conditional | Agent/Task subagent type |
+| `mcp.plugin` | str | conditional | MCP server name parsed from tool_name |
 
 See `SCHEMA` in the source for the complete list with conditions.
 
@@ -117,10 +128,16 @@ See `SCHEMA` in the source for the complete list with conditions.
 
 1. **Strict allowlist** — only fields in `ALLOWED_FIELDS` can appear in output
 2. **Blocklist** — `command`, `prompt`, `content`, `file_path`, `query`, etc. are NEVER copied from tool_input
-3. **No full paths** — only `cwd_basename` (last segment)
+3. **No full paths** — only `workspace.name` (last segment of cwd)
 4. **Secret redaction** — `sanitize_args()` scrubs AWS keys, JWTs, bearer tokens, private keys, passwords before any shipping
 5. **Fire-and-forget** — network errors silently swallowed, never blocks tool execution
 6. **Fork+detach** — parent returns immediately, child does the POST
+
+## Prompt ID correlation
+
+The hook correlates tool-use events back to the user prompt that triggered them via `prompt.id`. When a `UserPromptSubmit` event arrives, the hook reads the session transcript tail to extract the latest `promptId` and caches it to `/tmp/claude_otel_prompt_{session_id}`. Subsequent `PreToolUse` events for the same session attach this cached ID.
+
+This enables queries like "which tools were invoked by prompt X?" in your observability backend.
 
 ## Discovery mode
 

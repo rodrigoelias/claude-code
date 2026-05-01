@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 otel_tool_tracker.py — PreToolUse hook that ships Claude Code tool-use
-telemetry to New Relic's Events API.
+telemetry via OTLP (OpenTelemetry Protocol) HTTP/JSON.
 
 Design goals:
   * Never block tool execution (fire-and-forget, always exit 0).
@@ -156,7 +156,7 @@ _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
 
 def sanitize_args(raw: object) -> str:
-    """Sanitize a free-form skill args string before shipping to New Relic.
+    """Sanitize a free-form skill args string for telemetry export.
 
     Pipeline: coerce -> redact known secrets -> strip control bytes ->
     collapse newlines -> truncate. Pure function, no I/O.
@@ -188,7 +188,7 @@ def sanitize_args(raw: object) -> str:
 # --------------------------------------------------------------------------- #
 
 def should_track(tool_name: object) -> bool:
-    """Return True if this tool call should be shipped to New Relic."""
+    """Return True if this tool call should be tracked."""
     if not isinstance(tool_name, str) or not tool_name:
         return False
     return tool_name not in SKIP_TOOLS
@@ -252,10 +252,10 @@ _ROOT_KEY_MAP = {
 
 
 def _coerce_scalar(v: object) -> object:
-    """Coerce to a New Relic Events API-compatible scalar (str|int|float|bool).
+    """Coerce to an OTLP-compatible scalar (str|int|float|bool).
 
-    Returns None if the value is not a simple scalar (NR doesn't accept
-    nested objects in Events API).
+    Returns None if the value is not a simple scalar (OTLP attributes
+    don't accept nested objects).
     """
     if isinstance(v, bool) or isinstance(v, (int, float)):
         return v
@@ -265,7 +265,7 @@ def _coerce_scalar(v: object) -> object:
 
 
 def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
-    """Build the event dict to send to New Relic.
+    """Build the event dict for OTLP export.
 
     STRICT allowlist: keys in the output are always a subset of ALLOWED_FIELDS.
     tool_input is read only for sub-keys that are (a) in the per-tool allowlist
