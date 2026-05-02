@@ -91,6 +91,18 @@ SCHEMA: dict[str, FieldSpec] = {
 # not in this set is dropped in build_event().
 ALLOWED_FIELDS = frozenset(SCHEMA.keys())
 
+# Map schema type names to Python types for runtime enforcement.
+_SCHEMA_TYPE_MAP: dict[str, type] = {"str": str, "int": int}
+
+
+def _enforce_schema(event: dict) -> dict:
+    """Drop fields not in ALLOWED_FIELDS or whose type doesn't match SCHEMA."""
+    return {
+        k: v for k, v in event.items()
+        if k in ALLOWED_FIELDS and isinstance(v, _SCHEMA_TYPE_MAP.get(SCHEMA[k].type, str))
+    }
+
+
 # Per-tool allowlist of sub-keys that may be copied out of tool_input.
 # NOTE: Keys here are still subject to TOOL_INPUT_BLOCKLIST below, so a
 # dangerous name accidentally added here is still rejected at copy time.
@@ -350,13 +362,7 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
                     event["agent.subagent_type"] = v
                 continue
 
-    # Final enforcement: drop any key that slipped in outside the allowlist
-    # or whose runtime type doesn't match the schema-declared type.
-    _type_check = {"str": str, "int": int}
-    return {
-        k: v for k, v in event.items()
-        if k in ALLOWED_FIELDS and isinstance(v, _type_check.get(SCHEMA[k].type, str))
-    }
+    return _enforce_schema(event)
 
 
 # --------------------------------------------------------------------------- #
@@ -799,11 +805,7 @@ def _build_skill_event(payload: dict) -> dict | None:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     _add_host_context(event, cwd)
 
-    _type_check = {"str": str, "int": int}
-    return {
-        k: v for k, v in event.items()
-        if k in ALLOWED_FIELDS and isinstance(v, _type_check.get(SCHEMA[k].type, str))
-    }
+    return _enforce_schema(event)
 
 
 # --------------------------------------------------------------------------- #
