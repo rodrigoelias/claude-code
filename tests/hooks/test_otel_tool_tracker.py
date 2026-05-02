@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 # Add hooks dir to path so we can import the module under test.
@@ -529,6 +531,48 @@ class TestNonBlocking(unittest.TestCase):
             timeout=0.5,
         )
         self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_post_otlp_log_logs_429_to_file(self):
+        """HTTP 429 responses append a timestamp line to /tmp/claude_otel_429.log."""
+        log_path = "/tmp/claude_otel_429.log"
+        # Clean up from previous runs
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+
+        err = urllib.error.HTTPError(
+            "http://example.com/v1/logs", 429, "Too Many Requests", {}, None
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            hook.post_otlp_log(
+                "http://example.com",
+                {"api-key": "fake"},
+                [],
+                {"event.type": "ClaudeCodeToolUse", "tool.name": "Bash", "timestamp": 1000},
+            )
+        self.assertTrue(os.path.exists(log_path))
+        with open(log_path) as f:
+            lines = f.readlines()
+        self.assertGreaterEqual(len(lines), 1)
+        # Clean up
+        os.unlink(log_path)
+
+    def test_post_otlp_log_non_429_http_error_silent(self):
+        """Non-429 HTTP errors are silently swallowed (no log file written)."""
+        log_path = "/tmp/claude_otel_429.log"
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+
+        err = urllib.error.HTTPError(
+            "http://example.com/v1/logs", 500, "Server Error", {}, None
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            hook.post_otlp_log(
+                "http://example.com",
+                {"api-key": "fake"},
+                [],
+                {"event.type": "ClaudeCodeToolUse", "tool.name": "Bash", "timestamp": 1000},
+            )
+        self.assertFalse(os.path.exists(log_path))
 
     def test_process_hook_swallows_exceptions(self):
         # A broken build_event should not propagate.

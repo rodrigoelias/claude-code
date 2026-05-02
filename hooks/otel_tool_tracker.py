@@ -483,6 +483,18 @@ def load_otlp_config() -> tuple[str, dict[str, str], list[dict]] | None:
 # OTLP HTTP/JSON send
 # --------------------------------------------------------------------------- #
 
+_RATE_LIMIT_LOG = "/tmp/claude_otel_429.log"
+
+
+def _log_429() -> None:
+    """Append a timestamp to the rate-limit log. Best-effort, never raises."""
+    try:
+        with open(_RATE_LIMIT_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
+    except OSError:
+        pass
+
+
 _SSL_CTX: ssl.SSLContext | None = None
 
 
@@ -559,6 +571,10 @@ def post_otlp_log(endpoint: str, headers: dict[str, str],
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as resp:
             resp.read()  # drain
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _log_429()
+        return
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, ConnectionError):
         # Silently swallow network errors — telemetry must never disrupt
         # the developer's workflow.
