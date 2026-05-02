@@ -155,11 +155,15 @@ _CONTROL_BYTES = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
 
+_SANITIZE_INPUT_CAP = 65536  # Hard cap before running regex battery.
+
+
 def sanitize_args(raw: object) -> str:
     """Sanitize a free-form skill args string for telemetry export.
 
-    Pipeline: coerce -> redact known secrets -> strip control bytes ->
-    collapse newlines -> truncate. Pure function, no I/O.
+    Pipeline: coerce -> cap input size -> redact known secrets ->
+    strip control bytes -> collapse newlines -> truncate.
+    Pure function, no I/O.
     """
     if raw is None:
         return ""
@@ -167,6 +171,11 @@ def sanitize_args(raw: object) -> str:
         s = raw if isinstance(raw, str) else str(raw)
     except Exception:
         return ""
+
+    # Cap input before expensive operations to avoid O(n*patterns) on
+    # multi-MB inputs that are likely binary garbage.
+    if len(s) > _SANITIZE_INPUT_CAP:
+        s = s[:_SANITIZE_INPUT_CAP]
 
     # Re-encode to scrub invalid UTF-8 surrogates.
     s = s.encode("utf-8", "replace").decode("utf-8", "replace")
@@ -341,9 +350,13 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
                     event["agent.subagent_type"] = v
                 continue
 
-    # Final enforcement: drop any key that slipped in outside the allowlist.
-    # This is a defense-in-depth check; it should be a no-op by construction.
-    return {k: v for k, v in event.items() if k in ALLOWED_FIELDS}
+    # Final enforcement: drop any key that slipped in outside the allowlist
+    # or whose runtime type doesn't match the schema-declared type.
+    _type_check = {"str": str, "int": int}
+    return {
+        k: v for k, v in event.items()
+        if k in ALLOWED_FIELDS and isinstance(v, _type_check.get(SCHEMA[k].type, str))
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -470,6 +483,17 @@ def load_otlp_config() -> tuple[str, dict[str, str], list[dict]] | None:
 # OTLP HTTP/JSON send
 # --------------------------------------------------------------------------- #
 
+_SSL_CTX: ssl.SSLContext | None = None
+
+
+def _ssl_ctx() -> ssl.SSLContext:
+    """Lazily create and cache an SSL context (avoids re-parsing CA certs per POST)."""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
+
 def _event_to_otlp_attributes(event: dict) -> list[dict]:
     """Convert the flat event dict to OTLP KeyValue attribute list."""
     attrs: list[dict] = []
@@ -532,9 +556,8 @@ def post_otlp_log(endpoint: str, headers: dict[str, str],
     req_headers.update(headers)
 
     req = urllib.request.Request(url, data=body, method="POST", headers=req_headers)
-    ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as resp:
             resp.read()  # drain
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, ConnectionError):
         # Silently swallow network errors — telemetry must never disrupt
@@ -587,40 +610,45 @@ def _get_hostname() -> str:
         return ""
 
 
+# In production (fork-per-event), the cache is not reused across invocations.
+# It benefits library/test usage where process_hook is called multiple times.
+_REPO_CACHE: dict[str, str] = {}
+
+
 def _get_repo_name(cwd: str | None) -> str:
     """Derive a repo name from `git remote get-url origin` basename.
 
+    Cached per cwd to avoid spawning a subprocess on every tool event.
     Best-effort; returns "" on any failure.
     """
-    if not cwd or not isinstance(cwd, str) or not os.path.isdir(cwd):
+    if not cwd or not isinstance(cwd, str):
         cwd = os.getcwd()
+    if cwd in _REPO_CACHE:
+        return _REPO_CACHE[cwd]
     try:
         r = subprocess.run(
             ["git", "-C", cwd, "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=0.5,
         )
         if r.returncode != 0:
-            return ""
-        url = (r.stdout or "").strip()
-        if not url:
-            return ""
-        name = url.rstrip("/").split("/")[-1]
-        if name.endswith(".git"):
-            name = name[:-4]
-        return name
+            name = ""
+        else:
+            url = (r.stdout or "").strip()
+            if not url:
+                name = ""
+            else:
+                name = url.rstrip("/").split("/")[-1]
+                if name.endswith(".git"):
+                    name = name[:-4]
     except Exception:
-        return ""
+        name = ""
+    if len(_REPO_CACHE) < 32:  # Bound memory
+        _REPO_CACHE[cwd] = name
+    return name
 
-
-# --------------------------------------------------------------------------- #
-# Host context helpers (shared between event builders)
-# --------------------------------------------------------------------------- #
 
 def _get_user_login() -> str:
-    try:
-        return os.environ.get("USER") or os.environ.get("USERNAME") or ""
-    except Exception:
-        return ""
+    return os.environ.get("USER") or os.environ.get("USERNAME") or ""
 
 
 def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: str = "") -> None:
@@ -645,17 +673,23 @@ def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: st
 # --------------------------------------------------------------------------- #
 
 
+def _prompt_cache_path(session_id: str) -> str:
+    """Return the /tmp path for a session's cached prompt ID."""
+    return f"/tmp/claude_otel_prompt_{session_id}"
+
+
 def _tail_lines(path: str, n: int = 50, chunk: int = 8192) -> list[str]:
     """Read the last n lines of a file by seeking from the end.
 
     Returns [] on any I/O error (file missing, permissions, etc.).
     """
     try:
+        max_bytes = 128 * 1024  # 128KB byte budget to avoid reading entire file.
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             buf = b""
-            while size > 0 and buf.count(b"\n") <= n:
+            while size > 0 and buf.count(b"\n") <= n and len(buf) < max_bytes:
                 step = min(chunk, size)
                 size -= step
                 f.seek(size)
@@ -682,8 +716,8 @@ def _cache_prompt_id(payload: dict) -> None:
                     prompt_id = str(obj["promptId"]).strip()
                     if not prompt_id:
                         return
-                    tmp_path = f"/tmp/claude_otel_prompt_{session_id}.tmp"
-                    final_path = f"/tmp/claude_otel_prompt_{session_id}"
+                    final_path = _prompt_cache_path(session_id)
+                    tmp_path = final_path + ".tmp"
                     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     with os.fdopen(fd, "w") as wf:
                         wf.write(prompt_id)
@@ -700,9 +734,9 @@ def _read_cached_prompt_id(session_id: str) -> str | None:
     try:
         if not isinstance(session_id, str) or not _SAFE_SESSION_RE.match(session_id):
             return None
-        path = f"/tmp/claude_otel_prompt_{session_id}"
+        path = _prompt_cache_path(session_id)
         with open(path, "r") as f:
-            value = f.read().strip()
+            value = f.read(256).strip()
         return value if value else None
     except Exception:
         return None
@@ -749,7 +783,11 @@ def _build_skill_event(payload: dict) -> dict | None:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     _add_host_context(event, cwd)
 
-    return {k: v for k, v in event.items() if k in ALLOWED_FIELDS}
+    _type_check = {"str": str, "int": int}
+    return {
+        k: v for k, v in event.items()
+        if k in ALLOWED_FIELDS and isinstance(v, _type_check.get(SCHEMA[k].type, str))
+    }
 
 
 # --------------------------------------------------------------------------- #

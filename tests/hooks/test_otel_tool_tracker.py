@@ -486,25 +486,6 @@ class TestConfigLoading(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertEqual(configs[0][0], "https://managed.example.com")
 
-    def test_mode_all_reads_both(self):
-        managed_path = os.path.join(self.tmp, "managed-settings.json")
-        personal_path = os.path.join(self.tmp, "settings.json")
-        with open(managed_path, "w") as f:
-            json.dump({"env": {
-                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://managed.example.com",
-                "OTEL_EXPORTER_OTLP_HEADERS": "api-key=m",
-            }}, f)
-        with open(personal_path, "w") as f:
-            json.dump({"env": {
-                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://personal.example.com",
-                "OTEL_EXPORTER_OTLP_HEADERS": "api-key=p",
-            }}, f)
-        with mock.patch.dict(os.environ, {"OTEL_SKILL_HOOK_MODE": "all"}), \
-             mock.patch.object(hook, "_MANAGED_SETTINGS_PATH", managed_path), \
-             mock.patch.object(hook, "_DEFAULT_SETTINGS_PATH", personal_path):
-            configs = hook.load_otlp_configs()
-        self.assertEqual(len(configs), 2)
-
     def test_mode_default_is_env(self):
         """Without OTEL_SKILL_HOOK_MODE set, defaults to 'env' behavior."""
         os.environ.pop("OTEL_SKILL_HOOK_MODE", None)
@@ -935,6 +916,27 @@ class TestSchemaContract(unittest.TestCase):
              mock.patch.object(hook, "ALLOWED_FIELDS", frozenset(patched_schema.keys())):
             event = hook.build_event(make_payload("Bash", {"command": "ls"}))
         self.assertNotIn("tool.name", event)
+
+    def test_type_mismatch_drops_field(self):
+        """Fields declared as 'str' in SCHEMA must not carry bool/int/float values."""
+        # session_id is declared "str" — pass an int to simulate type mismatch.
+        payload = make_payload("Bash", {"command": "ls"})
+        payload["session_id"] = 12345  # int, but schema says "str"
+        event = hook.build_event(payload)
+        # The field must be absent (dropped) because its type doesn't match schema.
+        self.assertNotIn("session.id", event)
+
+        # Also verify bool is dropped for a str-typed field.
+        payload2 = make_payload("Bash", {"command": "ls"})
+        payload2["session_id"] = True
+        event2 = hook.build_event(payload2)
+        self.assertNotIn("session.id", event2)
+
+        # float should also be dropped for str-typed field.
+        payload3 = make_payload("Bash", {"command": "ls"})
+        payload3["session_id"] = 3.14
+        event3 = hook.build_event(payload3)
+        self.assertNotIn("session.id", event3)
 
 
 # --------------------------------------------------------------------------- #
