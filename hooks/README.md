@@ -90,7 +90,9 @@ All config comes from environment variables, either set directly or via `setting
 }
 ```
 
-> The empty `Bash` matcher is intentional — prevents the telemetry hook from running on Bash (which fires PreToolUse for every shell command).
+> **Matcher resolution order:** Claude Code evaluates matchers top-to-bottom and uses the **first match**. Place specific matchers (e.g., `"Bash"`) after general ones (e.g., `".*"`) — the specific matcher's hooks list replaces the catch-all for that tool name. An empty `hooks: []` array effectively disables the hook for that tool.
+>
+> The empty `Bash` matcher above is intentional — prevents the telemetry hook from running on Bash (which fires PreToolUse for every shell command).
 
 ## Event schema
 
