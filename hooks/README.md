@@ -53,6 +53,8 @@ All config comes from environment variables, either set directly or via `setting
 | `managed` | `/Library/Application Support/ClaudeCode/managed-settings.json` → `env` block |
 | `all` | Both managed + personal (deduped by endpoint URL) |
 
+> **Note:** The `managed` mode path (`/Library/Application Support/...`) is macOS-specific. On Linux the managed settings path differs — check your Claude Code distribution docs for the platform-appropriate location.
+
 ## settings.json hook config
 
 ```json
