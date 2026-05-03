@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-otel_tool_tracker.py — PreToolUse hook that ships Claude Code tool-use
-telemetry via OTLP (OpenTelemetry Protocol) HTTP/JSON.
+otel_tool_tracker.py — PreToolUse / UserPromptSubmit hook that ships
+Claude Code tool-use and skill-invocation telemetry via OTLP
+(OpenTelemetry Protocol) HTTP/JSON.
 
 Design goals:
-  * Never block tool execution (fire-and-forget, always exit 0).
+  * Never block tool execution — fire-and-forget through os.fork(),
+    parent always exits 0.
   * Never leak free-form user content (source code, secrets, file paths).
-    The event is gated by EMITTED_FIELDS (which attributes appear) and
-    TOOL_INPUT_SUBKEY_ALLOWLIST (which tool_input keys get extracted).
-    sanitize_args() provides additional redaction as a safety net.
-  * Configuration comes from Claude Code's managed-settings.json so the
-    platform team can roll it out company-wide without per-developer setup.
+    Events are built by copying only fields described in SCHEMA and
+    enforced by _enforce_schema; sanitize_args() redacts common secret
+    patterns as a safety net.
 
-See plans/snuggly-herding-gizmo.md for the full design.
+Configuration:
+  * CLAUDE_OTEL_CONFIG_MODE selects the source: "env" (default) uses
+    OTEL_* environment variables, "managed" reads managed-settings.json,
+    "file" reads a JSON file pointed at by CLAUDE_OTEL_CONFIG_FILE.
+  * Filtering is configurable per deployment: tool allow/block lists
+    and UserPromptSubmit skill filters accept tool names, regexes, or
+    dotted-path callables (see hooks/README.md).
+
+See hooks/README.md for the full configuration reference.
 """
 
 from __future__ import annotations
