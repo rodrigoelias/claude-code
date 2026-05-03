@@ -25,6 +25,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import otel_tool_tracker as hook  # noqa: E402
 
 
+def _can_write_tmp():
+    """Check if we can write to /tmp (macOS sandbox may block this)."""
+    try:
+        import tempfile
+        path = "/tmp/_otel_test_probe"
+        with open(path, "w") as f:
+            f.write("x")
+        os.unlink(path)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+_TMP_WRITABLE = _can_write_tmp()
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -590,6 +605,7 @@ class TestNonBlocking(unittest.TestCase):
         )
         self.assertLess(time.monotonic() - start, 2.0)
 
+    @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_post_otlp_log_logs_429_to_file(self):
         """HTTP 429 responses append a timestamp line to /tmp/claude_otel_429.log."""
         log_path = "/tmp/claude_otel_429.log"
@@ -1078,6 +1094,7 @@ class TestPromptIdCorrelation(unittest.TestCase):
         with open("/tmp/claude_otel_prompt_test_sess1") as f:
             self.assertEqual(f.read(), "prompt-abc-123")
 
+    @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_read_cached_prompt_id(self):
         with open("/tmp/claude_otel_prompt_test_sess2", "w") as f:
             f.write("prompt-xyz-789")
@@ -1091,6 +1108,7 @@ class TestPromptIdCorrelation(unittest.TestCase):
         self.assertIsNone(hook._read_cached_prompt_id("../etc/passwd"))
         self.assertIsNone(hook._read_cached_prompt_id("foo/bar"))
 
+    @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_prompt_id_in_build_event(self):
         # Pre-cache a prompt ID
         with open("/tmp/claude_otel_prompt_test_sess3", "w") as f:

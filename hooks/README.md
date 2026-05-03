@@ -136,7 +136,7 @@ Three constants at the top of `otel_tool_tracker.py` control what gets logged:
 
 Which tool categories produce events. Default: `{"skill", "agent", "mcp"}`.
 
-Available categories: `mutation` (Bash/Edit/Write), `skill`, `agent`, `mcp`, `other`.
+Available categories: `mutation` (Bash/Edit/Write), `skill`, `agent`, `mcp`, `other` (Read/Grep/Glob/WebFetch).
 
 ```python
 # Track everything including mutations:

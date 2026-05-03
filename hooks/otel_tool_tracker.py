@@ -780,6 +780,8 @@ def _build_skill_event(payload: dict) -> dict | None:
     if not skill_name:
         return None
 
+    # Fields below are candidates — _enforce_schema() strips any not in
+    # EMITTED_FIELDS | _ENVELOPE_FIELDS before returning.
     event: dict[str, object] = {
         "event.type": EVENT_TYPE,
         "event.name": "claude_code_hooks.skill_invoke",
