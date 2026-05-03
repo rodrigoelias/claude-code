@@ -21,8 +21,8 @@ Claude Code hook that ships tool-use and skill-invocation telemetry to OTLP-comp
 
 ### What's NOT tracked
 
-- File contents, prompts, code, paths (strict allowlist)
-- Read-only tools: `Read`, `Grep`, `Glob` (skipped — too noisy)
+- File contents, prompts, code, paths (strict schema-driven filtering)
+- Tools outside `TRACKED_CATEGORIES` (default: only `skill`, `agent`, `mcp`)
 - Non-slash user prompts (filtered in-script)
 
 ## Configuration
@@ -128,10 +128,79 @@ To remove a field: delete its entry from `SCHEMA` — tests will catch any code 
 
 See `SCHEMA` in the source for the complete list with conditions.
 
+## Customizing What Gets Logged
+
+Three constants at the top of `otel_tool_tracker.py` control what gets logged:
+
+### TRACKED_CATEGORIES
+
+Which tool categories produce events. Default: `{"skill", "agent", "mcp"}`.
+
+Available categories: `mutation` (Bash/Edit/Write), `skill`, `agent`, `mcp`, `other`.
+
+```python
+# Track everything including mutations:
+TRACKED_CATEGORIES = frozenset({"skill", "agent", "mcp", "mutation", "other"})
+```
+
+### TRACKED_TOOLS
+
+Fine-grained filter within tracked categories. Empty (default) = all tools in tracked categories pass.
+
+```python
+# Only track Agent and MCP tools, not Skills:
+TRACKED_TOOLS = frozenset({"Agent", "Task"})
+```
+
+### EMITTED_FIELDS
+
+Which attributes appear in the final event. Default: `{"timestamp", "tool.name", "tool.category", "user.login", "prompt.id"}`.
+
+Available fields (from SCHEMA):
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | int | Epoch milliseconds |
+| `tool.name` | str | Tool name (e.g., `Agent`, `mcp__github__search`) |
+| `tool.category` | str | Category: mutation/skill/agent/mcp/other |
+| `user.login` | str | $USER or $USERNAME |
+| `prompt.id` | str | Cached prompt ID for correlation |
+| `session.id` | str | Claude session identifier |
+| `tool.use_id` | str | Claude's tool use correlation ID |
+| `host.name` | str | Machine hostname |
+| `workspace.name` | str | Last segment of cwd |
+| `repo.name` | str | Git repo name from remote origin |
+| `hook.event_name` | str | Hook event that triggered this |
+| `plugin.name` | str | Plugin name from payload |
+| `plugin.version` | str | Plugin version |
+| `source` | str | Source field from payload |
+| `mcp.plugin` | str | MCP server name (parsed from tool_name) |
+| `mcp.tool` | str | MCP tool name (parsed from tool_name) |
+| `skill.name_hint` | str | Skill name from Skill(...) format |
+| `skill.name` | str | Skill name from tool_input or /command |
+| `skill.args_sanitized` | str | Redacted skill arguments |
+| `agent.subagent_type` | str | Subagent type (Agent/Task tools) |
+| `agent.model` | str | Model override (Agent/Task tools) |
+| `agent.id` | str | Agent identifier |
+| `agent.type` | str | Agent type |
+| `session.permission_mode` | str | Permission mode |
+
+```python
+# Add session and workspace context:
+EMITTED_FIELDS = frozenset({
+    "timestamp", "tool.name", "tool.category", "user.login", "prompt.id",
+    "session.id", "workspace.name", "host.name",
+})
+```
+
+### Envelope fields (always present)
+
+`event.type`, `event.name`, and `hook.version` are always emitted regardless of EMITTED_FIELDS. These identify the event in backends and cannot be suppressed.
+
 ## Security guarantees
 
-1. **Strict allowlist** — only fields in `ALLOWED_FIELDS` can appear in output
-2. **Blocklist** — `command`, `prompt`, `content`, `file_path`, `query`, etc. are NEVER copied from tool_input
+1. **Schema-driven filtering** — only fields in `EMITTED_FIELDS` ∪ `_ENVELOPE_FIELDS` can appear in output, validated against `SCHEMA`
+2. **Explicit extraction** — `tool_input` sub-keys are only copied via `TOOL_INPUT_SUBKEY_ALLOWLIST` (per-tool)
 3. **No full paths** — only `workspace.name` (last segment of cwd)
 4. **Secret redaction** — `sanitize_args()` scrubs AWS keys, JWTs, bearer tokens, private keys, passwords before any shipping
 5. **Fire-and-forget** — network errors silently swallowed, never blocks tool execution
@@ -168,4 +237,4 @@ python3 -m pytest hooks/test_otel_tool_tracker.py -v
 - **No dependencies** — stdlib only (urllib, json, ssl, socket, os)
 - **Fork model** — avoids blocking the 5s hook timeout on slow endpoints
 - **Single script** — handles both PreToolUse and UserPromptSubmit to avoid duplication
-- **Allowlist over blocklist** — new fields must be explicitly added to `ALLOWED_FIELDS`
+- **Configurable filtering** — `TRACKED_CATEGORIES`, `TRACKED_TOOLS`, and `EMITTED_FIELDS` control what's logged
