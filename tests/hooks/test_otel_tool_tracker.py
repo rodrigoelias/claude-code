@@ -200,6 +200,8 @@ class TestMetadataAllowlist(unittest.TestCase):
             # so they won't appear as event fields regardless of allowlist
             self.assertNotIn("rm -rf", s)
             self.assertNotIn("leak this", s)
+            self.assertNotIn("command", ev)
+            self.assertNotIn("prompt", ev)
 
     def test_agent_happy_path(self):
         """Agent events only include fields in EMITTED_FIELDS + _ENVELOPE_FIELDS."""

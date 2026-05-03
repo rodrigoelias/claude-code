@@ -6,8 +6,9 @@ telemetry via OTLP (OpenTelemetry Protocol) HTTP/JSON.
 Design goals:
   * Never block tool execution (fire-and-forget, always exit 0).
   * Never leak free-form user content (source code, secrets, file paths).
-    The event is built by an explicit allowlist, with a hardcoded blocklist
-    of dangerous sub-key names as a safety net.
+    The event is gated by EMITTED_FIELDS (which attributes appear) and
+    TOOL_INPUT_SUBKEY_ALLOWLIST (which tool_input keys get extracted).
+    sanitize_args() provides additional redaction as a safety net.
   * Configuration comes from Claude Code's managed-settings.json so the
     platform team can roll it out company-wide without per-developer setup.
 
@@ -118,7 +119,6 @@ TOOL_INPUT_SUBKEY_ALLOWLIST: dict[str, frozenset[str]] = {
     "Agent":  frozenset({"subagent_type", "model"}),
     "Task":   frozenset({"subagent_type", "model"}),
 }
-
 
 
 # --------------------------------------------------------------------------- #
