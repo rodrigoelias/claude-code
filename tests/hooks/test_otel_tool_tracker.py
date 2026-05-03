@@ -847,6 +847,50 @@ class TestMainStdin(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# TestForkSend — fork-safety behavior
+# --------------------------------------------------------------------------- #
+
+class TestForkSendSslCtxReset(unittest.TestCase):
+    """The child process must reset _SSL_CTX because OpenSSL is not fork-safe."""
+
+    def test_child_resets_ssl_ctx(self):
+        import ssl
+        original = hook._SSL_CTX
+        try:
+            # Simulate a cached context inherited from the parent.
+            hook._SSL_CTX = ssl.create_default_context()
+            observed = {}
+
+            def fake_process_hook(_payload):
+                # Capture the value of _SSL_CTX as seen by the "child".
+                observed["ssl_ctx"] = hook._SSL_CTX
+
+            with mock.patch.object(hook.os, "fork", return_value=0), \
+                 mock.patch.object(hook.os, "setsid"), \
+                 mock.patch.object(hook, "process_hook", side_effect=fake_process_hook), \
+                 mock.patch.object(hook.os, "_exit") as exit_mock:
+                hook._fork_send({"tool_name": "Bash"})
+
+            self.assertIsNone(observed.get("ssl_ctx"))
+            exit_mock.assert_called_once_with(0)
+        finally:
+            hook._SSL_CTX = original
+
+    def test_parent_does_not_reset_ssl_ctx(self):
+        import ssl
+        original = hook._SSL_CTX
+        try:
+            ctx = ssl.create_default_context()
+            hook._SSL_CTX = ctx
+            with mock.patch.object(hook.os, "fork", return_value=12345):
+                hook._fork_send({"tool_name": "Bash"})
+            # Parent's cached context is untouched.
+            self.assertIs(hook._SSL_CTX, ctx)
+        finally:
+            hook._SSL_CTX = original
+
+
+# --------------------------------------------------------------------------- #
 # Skill tracking (UserPromptSubmit)
 # --------------------------------------------------------------------------- #
 

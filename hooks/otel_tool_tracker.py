@@ -872,6 +872,10 @@ def _fork_send(payload: dict) -> None:
         os.setsid()
     except OSError:
         pass
+    # Reset cached SSL context: OpenSSL is not fork-safe, so the child must
+    # build its own context rather than inherit the parent's.
+    global _SSL_CTX
+    _SSL_CTX = None
     try:
         process_hook(payload)
     finally:
