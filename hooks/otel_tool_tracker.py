@@ -33,6 +33,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -502,13 +503,37 @@ def load_otlp_config() -> tuple[str, dict[str, str], list[dict]] | None:
 # OTLP HTTP/JSON send
 # --------------------------------------------------------------------------- #
 
-_RATE_LIMIT_LOG = "/tmp/claude_otel_429.log"
+def _tmp_base() -> str:
+    """Return a per-user subdirectory of the system tempdir.
+
+    On multi-user systems, hardcoded paths like /tmp/claude_otel_429.log are
+    exploitable via pre-created symlinks. Scoping under a 0700 per-user
+    directory makes those paths unreachable to other users.
+    """
+    getuid = getattr(os, "getuid", lambda: "default")
+    base = os.path.join(tempfile.gettempdir(), f"claude_otel_{getuid()}")
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=True)
+    except OSError:
+        return tempfile.gettempdir()
+    return base
+
+
+_RATE_LIMIT_LOG = os.path.join(_tmp_base(), "429.log")
 
 
 def _log_429() -> None:
-    """Append a timestamp to the rate-limit log. Best-effort, never raises."""
+    """Append a timestamp to the rate-limit log. Best-effort, never raises.
+
+    Opens with O_NOFOLLOW so a symlink at the log path is refused rather
+    than followed.
+    """
     try:
-        with open(_RATE_LIMIT_LOG, "a") as f:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(_RATE_LIMIT_LOG, flags, 0o600)
+        with os.fdopen(fd, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
     except OSError:
         pass
@@ -709,8 +734,8 @@ def _add_host_context(event: dict, cwd: str | None, hostname: str = "", repo: st
 
 
 def _prompt_cache_path(session_id: str) -> str:
-    """Return the /tmp path for a session's cached prompt ID."""
-    return f"/tmp/claude_otel_prompt_{session_id}"
+    """Return the per-user tempdir path for a session's cached prompt ID."""
+    return os.path.join(_tmp_base(), f"prompt_{session_id}")
 
 
 def _tail_lines(path: str, n: int = 50, chunk: int = 8192) -> list[str]:

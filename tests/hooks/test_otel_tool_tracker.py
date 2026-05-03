@@ -607,8 +607,8 @@ class TestNonBlocking(unittest.TestCase):
 
     @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_post_otlp_log_logs_429_to_file(self):
-        """HTTP 429 responses append a timestamp line to /tmp/claude_otel_429.log."""
-        log_path = "/tmp/claude_otel_429.log"
+        """HTTP 429 responses append a timestamp line to the rate-limit log."""
+        log_path = hook._RATE_LIMIT_LOG
         # Clean up from previous runs
         if os.path.exists(log_path):
             os.unlink(log_path)
@@ -632,7 +632,7 @@ class TestNonBlocking(unittest.TestCase):
 
     def test_post_otlp_log_non_429_http_error_silent(self):
         """Non-429 HTTP errors are silently swallowed (no log file written)."""
-        log_path = "/tmp/claude_otel_429.log"
+        log_path = hook._RATE_LIMIT_LOG
         if os.path.exists(log_path):
             os.unlink(log_path)
 
@@ -653,6 +653,62 @@ class TestNonBlocking(unittest.TestCase):
         with mock.patch.object(hook, "build_event", side_effect=RuntimeError("boom")):
             result = hook.process_hook(make_payload("Bash", {"command": "ls"}))
         self.assertIsNone(result)
+
+
+# --------------------------------------------------------------------------- #
+# TestTmpBase — per-user tempdir and symlink defense
+# --------------------------------------------------------------------------- #
+
+
+class TestTmpBase(unittest.TestCase):
+    def test_tmp_base_is_under_system_tempdir(self):
+        base = hook._tmp_base()
+        self.assertTrue(base.startswith(tempfile.gettempdir()))
+
+    def test_tmp_base_is_per_user(self):
+        base = hook._tmp_base()
+        # Either a uid-scoped dir on POSIX or a 'default' scoped dir elsewhere.
+        tail = os.path.basename(base)
+        self.assertTrue(
+            tail.startswith("claude_otel_") or base == tempfile.gettempdir(),
+            f"unexpected base dir: {base!r}",
+        )
+
+    def test_rate_limit_log_path_under_tmp_base(self):
+        self.assertTrue(
+            hook._RATE_LIMIT_LOG.startswith(hook._tmp_base())
+            or hook._RATE_LIMIT_LOG.startswith(tempfile.gettempdir())
+        )
+
+    def test_prompt_cache_path_under_tmp_base(self):
+        path = hook._prompt_cache_path("xyz")
+        self.assertTrue(
+            path.startswith(hook._tmp_base())
+            or path.startswith(tempfile.gettempdir())
+        )
+        self.assertTrue(path.endswith("prompt_xyz"))
+
+    @unittest.skipUnless(_TMP_WRITABLE and hasattr(os, "O_NOFOLLOW"),
+                         "requires writable tmp and O_NOFOLLOW")
+    def test_log_429_refuses_symlink(self):
+        """If a symlink exists at _RATE_LIMIT_LOG, _log_429 must not follow it."""
+        target_dir = tempfile.mkdtemp()
+        target = os.path.join(target_dir, "attacker_target")
+        try:
+            # Replace the module-level path with a symlink pointing at attacker target.
+            link_path = os.path.join(tempfile.mkdtemp(), "429.log")
+            os.symlink(target, link_path)
+            with mock.patch.object(hook, "_RATE_LIMIT_LOG", link_path):
+                hook._log_429()  # must silently fail rather than write through the link
+            # The attacker's target should not have been created.
+            self.assertFalse(os.path.exists(target))
+        finally:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            if os.path.lexists(link_path):
+                try:
+                    os.unlink(link_path)
+                except OSError:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1162,10 +1218,19 @@ class TestPromptIdCorrelation(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        # Clean up cached prompt files
+        # Clean up cached prompt files (both new per-user dir and any legacy
+        # locations left by earlier test runs).
         tmp_dir = tempfile.gettempdir()
-        for f in glob.glob(os.path.join(tmp_dir, "claude_otel_prompt_test_*")):
-            os.unlink(f)
+        patterns = [
+            os.path.join(tmp_dir, "claude_otel_prompt_test_*"),
+            os.path.join(hook._tmp_base(), "prompt_test_*"),
+        ]
+        for pat in patterns:
+            for f in glob.glob(pat):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
     def test_cache_prompt_id_writes_file(self):
         transcript = os.path.join(self.tmp_dir, "transcript.jsonl")
@@ -1173,12 +1238,12 @@ class TestPromptIdCorrelation(unittest.TestCase):
             f.write(json.dumps({"type": "user", "promptId": "prompt-abc-123"}) + "\n")
         payload = {"transcript_path": transcript, "session_id": "test_sess1"}
         hook._cache_prompt_id(payload)
-        with open("/tmp/claude_otel_prompt_test_sess1") as f:
+        with open(hook._prompt_cache_path("test_sess1")) as f:
             self.assertEqual(f.read(), "prompt-abc-123")
 
     @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_read_cached_prompt_id(self):
-        with open("/tmp/claude_otel_prompt_test_sess2", "w") as f:
+        with open(hook._prompt_cache_path("test_sess2"), "w") as f:
             f.write("prompt-xyz-789")
         result = hook._read_cached_prompt_id("test_sess2")
         self.assertEqual(result, "prompt-xyz-789")
@@ -1193,7 +1258,7 @@ class TestPromptIdCorrelation(unittest.TestCase):
     @unittest.skipUnless(_TMP_WRITABLE, "macOS sandbox blocks /tmp writes")
     def test_prompt_id_in_build_event(self):
         # Pre-cache a prompt ID
-        with open("/tmp/claude_otel_prompt_test_sess3", "w") as f:
+        with open(hook._prompt_cache_path("test_sess3"), "w") as f:
             f.write("prompt-in-event")
         payload = make_payload("Agent", {"subagent_type": "Explore"})
         payload["session_id"] = "test_sess3"
