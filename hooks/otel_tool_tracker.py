@@ -84,46 +84,42 @@ SCHEMA: dict[str, FieldSpec] = {
 }
 
 # --------------------------------------------------------------------------- #
-# Allowlists
+# Configurable filtering
 # --------------------------------------------------------------------------- #
 
-# Root allowlist: flat set of fields that may appear on the event. Any field
-# not in this set is dropped in build_event().
-ALLOWED_FIELDS = frozenset(SCHEMA.keys())
+# Tool admission: which tool categories get logged.
+TRACKED_CATEGORIES = frozenset({"skill", "agent", "mcp"})
+
+# Fine-grained tool filter (empty = all tools in tracked categories pass).
+TRACKED_TOOLS = frozenset()
+
+# Field emission: which attributes appear in the final event.
+EMITTED_FIELDS = frozenset({"timestamp", "tool.name", "tool.category", "user.login", "prompt.id"})
+
+# Mandatory envelope (always emitted, not user-configurable).
+_ENVELOPE_FIELDS = frozenset({"event.type", "event.name", "hook.version"})
 
 # Map schema type names to Python types for runtime enforcement.
 _SCHEMA_TYPE_MAP: dict[str, type] = {"str": str, "int": int}
 
 
 def _enforce_schema(event: dict) -> dict:
-    """Drop fields not in ALLOWED_FIELDS or whose type doesn't match SCHEMA."""
+    """Drop fields not in EMITTED_FIELDS/_ENVELOPE_FIELDS or whose type doesn't match SCHEMA."""
+    allowed = EMITTED_FIELDS | _ENVELOPE_FIELDS
     return {
         k: v for k, v in event.items()
-        if k in ALLOWED_FIELDS and isinstance(v, _SCHEMA_TYPE_MAP.get(SCHEMA[k].type, str))
+        if k in allowed and k in SCHEMA and isinstance(v, _SCHEMA_TYPE_MAP.get(SCHEMA[k].type, str))
     }
 
 
 # Per-tool allowlist of sub-keys that may be copied out of tool_input.
-# NOTE: Keys here are still subject to TOOL_INPUT_BLOCKLIST below, so a
-# dangerous name accidentally added here is still rejected at copy time.
 TOOL_INPUT_SUBKEY_ALLOWLIST: dict[str, frozenset[str]] = {
     "Skill":  frozenset({"skill", "args"}),
     "Agent":  frozenset({"subagent_type", "model"}),
     "Task":   frozenset({"subagent_type", "model"}),
 }
 
-# Hardcoded blocklist of sub-key names that are ALWAYS rejected from
-# tool_input, even if a future PR mistakenly adds them to an allowlist.
-# These are the free-form content fields across documented Claude Code tools.
-TOOL_INPUT_BLOCKLIST = frozenset({
-    "command", "prompt", "content", "old_string", "new_string",
-    "file_path", "query", "url", "description", "pattern",
-    "questions", "answers", "input", "output", "stdout", "stderr",
-    "message", "body", "text", "path", "glob",
-})
 
-# Tools we skip entirely (too noisy, low signal, read-only exploration).
-SKIP_TOOLS = frozenset({"Read", "Grep", "Glob"})
 
 # --------------------------------------------------------------------------- #
 # sanitize_args
@@ -212,7 +208,12 @@ def should_track(tool_name: object) -> bool:
     """Return True if this tool call should be tracked."""
     if not isinstance(tool_name, str) or not tool_name:
         return False
-    return tool_name not in SKIP_TOOLS
+    category = tool_category(tool_name)
+    if category not in TRACKED_CATEGORIES:
+        return False
+    if TRACKED_TOOLS and tool_name not in TRACKED_TOOLS:
+        return False
+    return True
 
 
 def tool_category(tool_name: str) -> str:
@@ -288,9 +289,8 @@ def _coerce_scalar(v: object) -> object:
 def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
     """Build the event dict for OTLP export.
 
-    STRICT allowlist: keys in the output are always a subset of ALLOWED_FIELDS.
-    tool_input is read only for sub-keys that are (a) in the per-tool allowlist
-    AND (b) NOT in the global blocklist.
+    STRICT allowlist: keys in the output are filtered by _enforce_schema().
+    tool_input is read only for sub-keys in the per-tool allowlist.
     """
     if not isinstance(payload, dict):
         return {}
@@ -332,10 +332,6 @@ def build_event(payload: dict, hostname: str = "", repo: str = "") -> dict:
     if isinstance(tool_input, dict):
         allowed_subkeys = TOOL_INPUT_SUBKEY_ALLOWLIST.get(tool_name, frozenset())
         for subkey in allowed_subkeys:
-            if subkey in TOOL_INPUT_BLOCKLIST:
-                # Safety net: refuse to copy a blocked name even if an
-                # allowlist mistakenly includes it.
-                continue
             if subkey not in tool_input:
                 continue
             raw_val = tool_input.get(subkey)
