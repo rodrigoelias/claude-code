@@ -890,6 +890,26 @@ class TestForkSendSslCtxReset(unittest.TestCase):
             hook._SSL_CTX = original
 
 
+class TestForkSendFallback(unittest.TestCase):
+    """When os.fork is unavailable (e.g. Windows) _fork_send falls back to
+    a synchronous process_hook call."""
+
+    def test_attribute_error_falls_back_to_sync(self):
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        with mock.patch.object(hook.os, "fork", side_effect=AttributeError), \
+             mock.patch.object(hook, "process_hook") as ph:
+            hook._fork_send(payload)
+        ph.assert_called_once_with(payload)
+
+    def test_os_error_falls_back_to_sync(self):
+        """OSError (e.g. EAGAIN when the process table is full) also falls back."""
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        with mock.patch.object(hook.os, "fork", side_effect=OSError("EAGAIN")), \
+             mock.patch.object(hook, "process_hook") as ph:
+            hook._fork_send(payload)
+        ph.assert_called_once_with(payload)
+
+
 # --------------------------------------------------------------------------- #
 # Skill tracking (UserPromptSubmit)
 # --------------------------------------------------------------------------- #
