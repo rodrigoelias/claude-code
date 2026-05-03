@@ -161,8 +161,8 @@ def _decision(result: subprocess.CompletedProcess) -> dict | None:
 
 
 def test_non_target_tool_allows(tmp_path: Path):
-    repo = _make_repo(tmp_path)
-    payload = _payload("Bash", {"command": "ls"}, repo)
+    # The tool_name guard fires before any filesystem I/O, so no repo needed.
+    payload = _payload("Bash", {"command": "ls"}, tmp_path)
     result = _run_hook(payload)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ""
@@ -293,8 +293,8 @@ def test_write_full_replace_schema_change_blocks(tmp_path: Path):
 
 
 def test_edit_replace_all_true_handled(tmp_path: Path):
-    # Seed the tracker with two identical "marker" placeholders, then use
-    # replace_all=True to swap both into two distinct new SCHEMA entries.
+    # Seed with MARKER_A / MARKER_B keys, then rename both via replace_all.
+    # Both renames should appear as added, both originals as removed.
     entries = [
         ("event.type", 'FieldSpec("str", "always", "")'),
         ("MARKER_A", 'FieldSpec("str", "always", "")'),
@@ -303,29 +303,16 @@ def test_edit_replace_all_true_handled(tmp_path: Path):
     repo = _make_repo(tmp_path, schema_entries=entries)
     tracker = repo / "hooks" / "otel_tool_tracker.py"
 
-    # Use replace_all to rewrite the whole SCHEMA body with two new keys.
-    # Here we replace the entire dict literal in one go via replace_all=True
-    # on a unique substring. This simulates e.g. a mass rename.
-    old = 'FieldSpec("str", "always", "")'
-    new = 'FieldSpec("str", "conditional", "added")'
     payload = _payload(
         "Edit",
         {
             "file_path": str(tracker),
-            "old_string": old,
-            "new_string": new,
+            "old_string": "MARKER_",
+            "new_string": "ADDED_",
             "replace_all": True,
         },
         repo,
     )
-    # This doesn't change keys — but replace_all on a key-adding edit does.
-    # Build a key-adding replace_all: rename both MARKER_* to ADDED_*.
-    payload["tool_input"] = {
-        "file_path": str(tracker),
-        "old_string": "MARKER_",
-        "new_string": "ADDED_",
-        "replace_all": True,
-    }
     result = _run_hook(payload)
     assert result.returncode == 0, result.stderr
     decision = _decision(result)

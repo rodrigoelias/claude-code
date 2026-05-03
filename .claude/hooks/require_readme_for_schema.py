@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -79,13 +78,13 @@ def _project_content(current: str, tool_name: str, tool_input: dict) -> str | No
         if not isinstance(content, str):
             return None
         return content
-    # Edit
     old = tool_input.get("old_string")
     new = tool_input.get("new_string")
     if not isinstance(old, str) or not isinstance(new, str):
         return None
     if old not in current:
-        return None  # Real Edit would fail; treat as no-op for our purposes.
+        # Matches real Edit semantics: a missing old_string would fail.
+        return None
     if tool_input.get("replace_all"):
         return current.replace(old, new)
     return current.replace(old, new, 1)
@@ -101,20 +100,19 @@ def _extract_schema_keys(source: str) -> set[str] | None:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-    except Exception:  # pragma: no cover - defensive
-        return None
 
-    for node in ast.walk(tree):
-        value = None
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            if any(isinstance(t, ast.Name) and t.id == "SCHEMA" for t in targets):
-                value = node.value
-        elif isinstance(node, ast.AnnAssign):
-            tgt = node.target
-            if isinstance(tgt, ast.Name) and tgt.id == "SCHEMA":
-                value = node.value
-        if value is None:
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SCHEMA" for t in node.targets
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "SCHEMA"
+        ):
+            value = node.value
+        else:
             continue
         if not isinstance(value, ast.Dict):
             return None
@@ -150,7 +148,6 @@ def _readme_modified(cwd: Path) -> bool | None:
 
 
 def main() -> None:
-    # 1. Parse payload. Malformed → fail-open.
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError, OSError):
@@ -170,57 +167,48 @@ def main() -> None:
     if not isinstance(cwd_raw, str):
         _allow()
 
+    raw_fp = tool_input.get("file_path")
+    if not isinstance(raw_fp, str):
+        _allow()
+
+    # Cheap prescreen: most Edit/Write calls don't target the tracker, so
+    # short-circuit on filename before any filesystem syscalls. The stricter
+    # canonical-path check follows below.
+    if not raw_fp.endswith(TARGET_REL.name):
+        _allow()
+
     try:
         cwd = Path(cwd_raw).resolve()
+        fp_abs = Path(raw_fp).resolve()
     except (OSError, RuntimeError):
         _allow()
 
     target_abs = (cwd / TARGET_REL).resolve()
-
-    # 2. Does this tool call target the tracker file?
-    raw_fp = tool_input.get("file_path")
-    if not isinstance(raw_fp, str):
-        _allow()
-    try:
-        fp_abs = Path(raw_fp).resolve()
-    except (OSError, RuntimeError):
-        _allow()
     if fp_abs != target_abs:
         _allow()
 
-    # 3. Read current content.
     try:
         current = target_abs.read_text()
     except OSError:
         _allow()
 
-    # 4. Project new content.
     projected = _project_content(current, tool_name, tool_input)
-    if projected is None:
-        _allow()
-    if projected == current:
+    if projected is None or projected == current:
         _allow()
 
-    # 5. Extract SCHEMA keys from both versions.
     old_keys = _extract_schema_keys(current)
     new_keys = _extract_schema_keys(projected)
     if old_keys is None or new_keys is None:
-        _allow()  # Fail-open on unparseable SCHEMA.
+        _allow()
 
     if old_keys == new_keys:
         _allow()
 
-    # 6. Consult git for README state.
     modified = _readme_modified(cwd)
-    if modified is None:
-        _allow()  # Fail-open on git error.
-    if modified:
-        _allow()  # README was updated alongside — allow.
+    if modified is None or modified:
+        _allow()
 
-    # 7. Deny.
-    added = new_keys - old_keys
-    removed = old_keys - new_keys
-    _deny(added, removed)
+    _deny(new_keys - old_keys, old_keys - new_keys)
 
 
 if __name__ == "__main__":
