@@ -1090,6 +1090,24 @@ class TestSchemaContract(unittest.TestCase):
             event = hook.build_event(make_payload("Agent", {"subagent_type": "Explore"}))
         self.assertNotIn("tool.name", event)
 
+    def test_bool_rejected_for_int_field(self):
+        """bool is a subclass of int in Python — _enforce_schema must NOT
+        pass booleans through an int-typed field."""
+        # `timestamp` is declared as "int" in SCHEMA and is always emitted.
+        event_in = {
+            "event.type": "ClaudeCodeToolUse",
+            "event.name": "PreToolUse",
+            "hook.version": "1",
+            "timestamp": True,  # bool, should be rejected for int field
+        }
+        event_out = hook._enforce_schema(event_in)
+        self.assertNotIn("timestamp", event_out)
+
+        # And an actual int should still pass through.
+        event_in["timestamp"] = 1700000000000
+        event_out = hook._enforce_schema(event_in)
+        self.assertEqual(event_out.get("timestamp"), 1700000000000)
+
     def test_type_mismatch_drops_field(self):
         """Fields declared as 'str' in SCHEMA must not carry bool/int/float values."""
         with mock.patch.object(hook, "EMITTED_FIELDS",

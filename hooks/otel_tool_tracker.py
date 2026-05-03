@@ -115,10 +115,19 @@ _SCHEMA_TYPE_MAP: dict[str, type] = {"str": str, "int": int}
 def _enforce_schema(event: dict) -> dict:
     """Drop fields not in EMITTED_FIELDS/_ENVELOPE_FIELDS or whose type doesn't match SCHEMA."""
     allowed = EMITTED_FIELDS | _ENVELOPE_FIELDS
-    return {
-        k: v for k, v in event.items()
-        if k in allowed and k in SCHEMA and isinstance(v, _SCHEMA_TYPE_MAP.get(SCHEMA[k].type, str))
-    }
+    out: dict = {}
+    for k, v in event.items():
+        if k not in allowed or k not in SCHEMA:
+            continue
+        expected = _SCHEMA_TYPE_MAP.get(SCHEMA[k].type, str)
+        # bool is a subclass of int in Python; reject it for non-bool fields
+        # so True/False can't sneak through an int-typed slot.
+        if isinstance(v, bool) and expected is not bool:
+            continue
+        if not isinstance(v, expected):
+            continue
+        out[k] = v
+    return out
 
 
 # Per-tool allowlist of sub-keys that may be copied out of tool_input.
