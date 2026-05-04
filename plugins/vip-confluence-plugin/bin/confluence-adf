@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 1. Dev mode: if an editable .venv is present with the entry point, use it directly.
+if [ -x "$PLUGIN_ROOT/.venv/bin/confluence-adf" ]; then
+  exec "$PLUGIN_ROOT/.venv/bin/confluence-adf" "$@"
+fi
+
+# 2. Published mode: download the shiv zipapp keyed by plugin.json version, cache it,
+#    and exec it with the system python3.
+VERSION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" \
+  "$PLUGIN_ROOT/.claude-plugin/plugin.json")
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/confluence-adf"
+PYZ="$CACHE_DIR/confluence-adf-$VERSION.pyz"
+
+if [ ! -f "$PYZ" ]; then
+  mkdir -p "$CACHE_DIR"
+  URL="https://github.com/rodrigoelias/claude-code/releases/download/confluence-adf-v$VERSION/confluence-adf.pyz"
+  echo "confluence-adf: downloading CLI v$VERSION..." >&2
+  if ! curl -fsSL -o "$PYZ.tmp" "$URL"; then
+    echo "confluence-adf: failed to download $URL" >&2
+    echo "Check that the GitHub release exists for plugin version $VERSION." >&2
+    rm -f "$PYZ.tmp"
+    exit 1
+  fi
+  mv "$PYZ.tmp" "$PYZ"
+fi
+
+# Require python3 >= 3.11. Check politely but don't be paranoid — shiv will raise if below.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "confluence-adf: python3 (>=3.11) is required on PATH." >&2
+  exit 1
+fi
+
+exec python3 "$PYZ" "$@"

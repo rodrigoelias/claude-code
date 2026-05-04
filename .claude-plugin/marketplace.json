@@ -1,0 +1,18 @@
+{
+  "name": "ai-enterprise",
+  "owner": { "name": "Rodrigo Elias" },
+  "plugins": [
+    {
+      "name": "otel-tool-tracker",
+      "source": "./plugins/otel-tool-tracker",
+      "description": "Privacy-first OTLP telemetry hook for Claude Code tool use and slash-command invocations.",
+      "version": "0.2.0"
+    },
+    {
+      "name": "vip-confluence-plugin",
+      "source": "./plugins/vip-confluence-plugin",
+      "description": "Deterministic ADF parser + drill-down skill for Confluence pages. Keeps raw ADF JSON out of the LLM context.",
+      "version": "0.1.13"
+    }
+  ]
+}

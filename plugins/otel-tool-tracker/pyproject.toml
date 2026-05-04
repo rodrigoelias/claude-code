@@ -1,8 +1,12 @@
 [project]
 name = "claude-code-hooks"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
 pythonpath = ["hooks"]
 testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+files = ["hooks/otel_setup.py"]
