@@ -2,6 +2,13 @@
 
 Claude Code hook that ships tool-use and skill-invocation telemetry to OTLP-compatible endpoints (e.g., New Relic, Grafana, Honeycomb).
 
+## Install
+
+This hook is distributed as the `otel-tool-tracker` Claude Code plugin. See
+the top-level [README](../README.md) for `/plugin install` instructions. The
+content below is the reference documentation for the hook's behavior,
+schema, and configuration — useful after install or for manual setups.
+
 ## How it works
 
 ```

@@ -1,0 +1,17 @@
+{
+  "name": "otel-tool-tracker",
+  "version": "0.2.0",
+  "description": "Privacy-first OTLP telemetry hook for Claude Code. Ships tool-use and skill-invocation events to any OTLP-compatible backend (New Relic, Grafana, Honeycomb) without leaking source code, prompts, or secrets.",
+  "author": {
+    "name": "Rodrigo Elias"
+  },
+  "homepage": "https://github.com/rodrigoelias/claude-code",
+  "license": "MIT",
+  "keywords": [
+    "telemetry",
+    "otel",
+    "opentelemetry",
+    "observability",
+    "hooks"
+  ]
+}

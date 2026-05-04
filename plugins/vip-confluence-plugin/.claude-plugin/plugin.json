@@ -1,0 +1,17 @@
+{
+  "name": "vip-confluence-plugin",
+  "version": "0.1.13",
+  "description": "Deterministic ADF parser + drill-down skill for Confluence pages. Keeps raw ADF JSON out of the LLM context.",
+  "author": {
+    "name": "Rodrigo Elias"
+  },
+  "homepage": "https://github.com/rodrigoelias/claude-code",
+  "license": "Apache-2.0",
+  "keywords": [
+    "confluence",
+    "adf",
+    "atlassian",
+    "skill",
+    "context-safety"
+  ]
+}

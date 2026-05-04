@@ -1,43 +1,31 @@
-# claude-code
+# ai-enterprise
 
-Privacy-first telemetry hook for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that ships tool-use events to any OTLP-compatible backend (New Relic, Grafana, Honeycomb, etc.) — without leaking source code, prompts, or secrets.
+`ai-enterprise` — Claude Code plugins by Rodrigo Elias.
 
-## What's included
+## Add the marketplace
 
-| Component | Description |
+In a Claude Code session:
+
+```
+/plugin marketplace add rodrigoelias/claude-code
+```
+
+## Included plugins
+
+| Plugin | Description |
 |---|---|
-| [`hooks/otel_tool_tracker.py`](hooks/otel_tool_tracker.py) | PreToolUse + UserPromptSubmit hook — zero dependencies, fork-and-detach delivery |
+| [`otel-tool-tracker`](plugins/otel-tool-tracker/) | Privacy-first OTLP telemetry for Claude Code tool use |
+| [`vip-confluence-plugin`](plugins/vip-confluence-plugin/) | Deterministic ADF parser + Confluence drill-down skill |
 
-See [`hooks/README.md`](hooks/README.md) for the full design, schema, security model, and configuration reference.
+## Install
 
-## Prerequisites
-
-- Python 3.10+
-- Claude Code with hooks support
-
-## Quick start
-
-```bash
-# 1. Clone
-git clone https://github.com/<you>/claude-code.git
-cd claude-code
-
-# 2. Copy the hook into place
-cp hooks/otel_tool_tracker.py ~/.claude/hooks/
-
-# 3. Configure your endpoint (e.g. New Relic)
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp.eu01.nr-data.net"
-export OTEL_EXPORTER_OTLP_HEADERS="api-key=YOUR_KEY"
-
-# 4. Add hook config to ~/.claude/settings.json (see hooks/README.md for full example)
+```
+/plugin install otel-tool-tracker@ai-enterprise
+/plugin install vip-confluence-plugin@ai-enterprise
 ```
 
-## Running tests
-
-```bash
-pytest -v
-```
+See each plugin's README for configuration details and requirements.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+See [LICENSE](LICENSE).
