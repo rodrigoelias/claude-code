@@ -15,7 +15,7 @@ In a Claude Code session:
 | Plugin | Description |
 |---|---|
 | [`otel-tool-tracker`](plugins/otel-tool-tracker/) | Privacy-first OTLP telemetry for Claude Code tool use |
-| [`vip-confluence-plugin`](plugins/vip-confluence-plugin/) | Deterministic ADF parser + Confluence drill-down skill |
+| [`vip-confluence-plugin`](plugins/vip-confluence-plugin/) | Deterministic ADF parser + Confluence drill-down skill (beta) |
 
 ## Install
 
