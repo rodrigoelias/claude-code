@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from datetime import date, datetime
 from pathlib import Path
 
 # Subcommands that take a page_id as the first positional arg
@@ -251,6 +252,30 @@ def _write_choice_pending(page_id: str) -> None:
 
 
 
+def _is_stale_pref(page_id: str) -> bool:
+    """Check if the pref file for a page is from a prior calendar day."""
+    pref_file = _pref_dir() / f"{page_id}.draft-pref"
+    if not pref_file.exists():
+        return False
+    mtime = datetime.fromtimestamp(pref_file.stat().st_mtime).date()
+    return mtime < date.today()
+
+
+def _cleanup_stale_session(page_id: str, cwd: str) -> None:
+    """Remove all session state for a page: pref, markers, and shadow files."""
+    pref_dir = _pref_dir()
+    for suffix in (".draft-pref", ".choice-pending", ".shadow-created"):
+        f = pref_dir / f"{page_id}{suffix}"
+        if f.exists():
+            f.unlink()
+
+    # Remove shadow files
+    shadow_dir = Path(cwd) / ".confluence-adf" / "shadows"
+    if shadow_dir.is_dir():
+        for f in shadow_dir.glob(f"{page_id}_v*"):
+            f.unlink()
+
+
 def _auto_discard_pending(page_id: str) -> None:
     """Delete pending.json for a page (auto-discard stale edits)."""
     cache_home = os.environ.get(
@@ -286,6 +311,10 @@ def handle_pre_tool_use(payload: dict, cwd: str | None = None) -> dict:
 
     subcommand = parsed["subcommand"]
     page_id = parsed["page_id"]
+
+    # ── Stale pref cleanup (prior calendar day) ──
+    if _is_stale_pref(page_id):
+        _cleanup_stale_session(page_id, cwd)
 
     # ── Shadow intercept for `get` (only after base is chosen) ──
     if subcommand == "get" and parsed["path_id"]:
