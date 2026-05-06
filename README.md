@@ -15,13 +15,13 @@ In a Claude Code session:
 | Plugin | Description |
 |---|---|
 | [`otel-tool-tracker`](plugins/otel-tool-tracker/) | Privacy-first OTLP telemetry for Claude Code tool use |
-| [`vip-confluence-plugin`](plugins/vip-confluence-plugin/) | Deterministic ADF parser + Confluence drill-down skill (beta) |
+| [`mini-confluence-plugin`](plugins/mini-confluence-plugin/) | Deterministic ADF parser + Confluence drill-down skill (beta) |
 
 ## Install
 
 ```
 /plugin install otel-tool-tracker@ai-enterprise
-/plugin install vip-confluence-plugin@ai-enterprise
+/plugin install mini-confluence-plugin@ai-enterprise
 ```
 
 See each plugin's README for configuration details and requirements.

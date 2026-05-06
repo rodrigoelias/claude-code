@@ -1,4 +1,4 @@
-# vip-confluence-plugin
+# mini-confluence-plugin
 
 Deterministic ADF parser and drill-down skill for Confluence pages — keeps raw ADF JSON out of the LLM context.
 
@@ -8,7 +8,7 @@ In a Claude Code session:
 
 ```
 /plugin marketplace add rodrigoelias/claude-code
-/plugin install vip-confluence-plugin@ai-enterprise
+/plugin install mini-confluence-plugin@ai-enterprise
 ```
 
 ## Requirements

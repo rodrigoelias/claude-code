@@ -1,5 +1,5 @@
 {
-  "name": "vip-confluence-plugin",
+  "name": "mini-confluence-plugin",
   "version": "0.1.14",
   "description": "Deterministic ADF parser + drill-down skill for Confluence pages. Keeps raw ADF JSON out of the LLM context.",
   "author": {
